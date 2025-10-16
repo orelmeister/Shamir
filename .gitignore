@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets and credentials
+.env
+*.json
+!requirements.json
+
+# Logs
+logs/
+*.log
+
+# VS Code
+.vscode/
+
+# Data and reports
+reports/
+charts/
+assets/
+full_market_data.json
+full_analysis_results.json
+daily_analysis_cache.json
+ollama_analysis_cache.json
+trading_queue.json
+us_tickers.json
+api_cost_log.json
+analysis_results_*.json
+authentic-genre-*.json
