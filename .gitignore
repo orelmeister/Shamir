@@ -9,15 +9,18 @@ venv/
 .venv/
 env/
 ENV/
+.venv-daytrader/
 
 # Secrets and credentials
 .env
 *.json
 !requirements.json
 
-# Logs
+# Logs and log files
 logs/
 *.log
+log*.txt
+day_trader_run_*.json
 
 # VS Code
 .vscode/
@@ -26,6 +29,8 @@ logs/
 reports/
 charts/
 assets/
+
+# Market data files (regenerated daily)
 full_market_data.json
 full_analysis_results.json
 daily_analysis_cache.json
@@ -35,3 +40,34 @@ us_tickers.json
 api_cost_log.json
 analysis_results_*.json
 authentic-genre-*.json
+
+# Day trading specific files (regenerated daily)
+day_trading_watchlist.json
+day_trader_*.json
+*.csv
+
+# Test files
+test_*.py
+*_test.py
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+*.idea/
+*.sublime-*
+
+# Python distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg

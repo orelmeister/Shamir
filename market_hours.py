@@ -19,23 +19,35 @@ import logging
 def is_market_open():
     """
     Checks if the NYSE market is currently open using America/New_York timezone.
+    Simplified to avoid pandas_market_calendars library issues.
 
     Returns:
         bool: True if the market is open, False otherwise.
     """
     try:
-        nyse = mcal.get_calendar('NYSE')
         ny_tz = pytz.timezone('America/New_York')
         
         # Get the current time in the NYSE timezone
         now_ny = datetime.now(ny_tz)
         
-        # Get today's schedule
-        schedule = nyse.schedule(start_date=now_ny.date(), end_date=now_ny.date())
-
-        if schedule.empty:
-            logging.info(f"Market is closed today (weekend or holiday). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
+        # Simple check: weekday (0-4 = Mon-Fri) and between 9:30 AM - 4:00 PM
+        is_weekday = now_ny.weekday() < 5
+        current_time = now_ny.time()
+        market_open_time = datetime.strptime("09:30", "%H:%M").time()
+        market_close_time = datetime.strptime("16:00", "%H:%M").time()
+        
+        is_trading_hours = market_open_time <= current_time <= market_close_time
+        
+        if not is_weekday:
+            logging.info(f"Market is closed (weekend). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
             return False
+        
+        if not is_trading_hours:
+            logging.info(f"Market is closed (outside trading hours). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
+            return False
+        
+        # Market is open
+        return True
 
         # Get market open and close times from the schedule. These are in UTC.
         market_open_utc = schedule.iloc[0].market_open

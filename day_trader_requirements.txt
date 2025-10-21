@@ -1,0 +1,14 @@
+python-dotenv
+ib_insync
+langchain
+langchain-google-vertexai
+pandas
+pytz
+pandas-ta
+langchain-deepseek
+langchain-ollama
+pandas_market_calendars
+langchain-community
+langchain-google-genai
+yfinance
+aiohttp
