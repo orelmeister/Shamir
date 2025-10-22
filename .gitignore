@@ -44,6 +44,10 @@ authentic-genre-*.json
 # Day trading specific files (regenerated daily)
 day_trading_watchlist.json
 day_trader_*.json
+atr_predictions.json
+validated_tickers.json
+ranked_tickers.json
+backtest_results_*.json
 *.csv
 
 # Test files

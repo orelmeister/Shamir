@@ -107,8 +107,14 @@ class DataAggregatorAgent(BaseDayTraderAgent):
                 return []
 
             self.log(logging.INFO, f"Found {len(tickers)} target tickers to process.")
+            
+            # Filter by yesterday's ATR (volatility pre-screening)
+            self.log(logging.INFO, "Pre-filtering tickers by yesterday's ATR (must be > 1.0%)...")
+            filtered_tickers = await self._filter_by_atr(tickers)
+            self.log(logging.INFO, f"After ATR filter: {len(filtered_tickers)} tickers remain (from {len(tickers)}).")
+            
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-            tasks = [self._fetch_stock_data_with_semaphore(session, ticker, semaphore) for ticker in tickers]
+            tasks = [self._fetch_stock_data_with_semaphore(session, ticker, semaphore) for ticker in filtered_tickers]
             results = await asyncio.gather(*tasks)
 
         for data in results:
@@ -128,7 +134,7 @@ class DataAggregatorAgent(BaseDayTraderAgent):
             self.log(logging.INFO, f"Querying for exchange: {exchange.upper()}")
             params = {
                 "marketCapMoreThan": 50000000,
-                "marketCapLowerThan": 350000000,
+                "marketCapLowerThan": 2000000000,  # Raised to $2B for better liquidity
                 "priceMoreThan": 1,
                 "volumeMoreThan": 50000,
                 "isEtf": "false",
@@ -155,6 +161,62 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         
         self.log(logging.INFO, f"Found a total of {len(all_tickers)} unique tickers across all exchanges.")
         return list(all_tickers)
+
+    async def _filter_by_atr(self, tickers: list) -> list:
+        """
+        Filter tickers by yesterday's ATR (Average True Range).
+        Only keep stocks with historical volatility > 1.0%.
+        This pre-screens out dead/quiet stocks before expensive LLM analysis.
+        """
+        from datetime import datetime, timedelta
+        
+        filtered = []
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        self.log(logging.INFO, f"Calculating yesterday's ATR for {len(tickers)} tickers...")
+        
+        # Process in batches to avoid overwhelming yfinance
+        batch_size = 50
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i+batch_size]
+            
+            for ticker in batch:
+                try:
+                    # Use yfinance for historical data (faster than IBKR for bulk queries)
+                    stock = yf.Ticker(ticker)
+                    hist = stock.history(period="1mo", interval="1d")
+                    
+                    if hist.empty or len(hist) < 14:
+                        self.log(logging.DEBUG, f"{ticker}: Insufficient historical data")
+                        continue
+                    
+                    # Calculate ATR (14-day period)
+                    high_low = hist['High'] - hist['Low']
+                    high_close = abs(hist['High'] - hist['Close'].shift())
+                    low_close = abs(hist['Low'] - hist['Close'].shift())
+                    
+                    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                    atr = true_range.rolling(window=14).mean().iloc[-1]
+                    
+                    # Convert to percentage
+                    current_price = hist['Close'].iloc[-1]
+                    atr_pct = (atr / current_price) * 100
+                    
+                    # Filter: Only keep if ATR > 1.0%
+                    if atr_pct >= 1.0:
+                        filtered.append(ticker)
+                        self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% ✅")
+                    else:
+                        self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% (too low)")
+                    
+                except Exception as e:
+                    self.log(logging.DEBUG, f"{ticker}: Error calculating ATR: {e}")
+                    continue
+            
+            # Small delay between batches
+            await asyncio.sleep(0.5)
+        
+        return filtered
 
     async def _fetch_stock_data_with_semaphore(self, session, ticker, semaphore):
         async with semaphore:
@@ -452,6 +514,427 @@ class WatchlistAnalystAgent(BaseDayTraderAgent):
             json.dump(watchlist, f, indent=4)
         
         self.log(logging.INFO, "Watchlist generation complete.")
+
+
+class ATRPredictorAgent(BaseDayTraderAgent):
+    """
+    Uses LLM to predict TODAY's volatility based on morning news and yesterday's ATR.
+    This helps filter stocks BEFORE deep analysis - only analyze stocks likely to move.
+    """
+    def __init__(self, orchestrator):
+        super().__init__(orchestrator, "ATRPredictorAgent")
+        self.log(logging.INFO, "ATR Predictor Agent initialized.")
+    
+    def run(self, market_data: list) -> list:
+        """
+        Predict ATR for each stock and return top candidates.
+        
+        Args:
+            market_data: List of stock data from DataAggregatorAgent
+            
+        Returns:
+            List of stocks with predicted ATR > 1.5%, sorted by confidence
+        """
+        self.log(logging.INFO, f"--- [PHASE 0.5] ATR Prediction for {len(market_data)} stocks ---")
+        
+        predictions = []
+        
+        # Use parallel processing for speed
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            future_to_ticker = {
+                executor.submit(self._predict_atr, stock): stock['ticker'] 
+                for stock in market_data
+            }
+            
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    result = future.result()
+                    if result and result.get('predicted_atr', 0) >= 1.5:
+                        predictions.append(result)
+                        self.log(logging.INFO, 
+                                f"{ticker}: Predicted ATR {result['predicted_atr']:.2f}% "
+                                f"(confidence: {result['confidence']:.2f})")
+                except Exception as e:
+                    self.log(logging.ERROR, f"ATR prediction failed for {ticker}: {e}")
+        
+        # Sort by confidence * predicted_atr (highest potential first)
+        predictions.sort(key=lambda x: x['confidence'] * x['predicted_atr'], reverse=True)
+        
+        # Return top 50 (or all if less than 50)
+        top_predictions = predictions[:50]
+        self.log(logging.INFO, f"ATR Prediction complete. Top {len(top_predictions)} stocks selected.")
+        
+        return top_predictions
+    
+    def _predict_atr(self, stock_data: dict) -> dict:
+        """Predict ATR for a single stock using LLM."""
+        ticker = stock_data['ticker']
+        
+        # Calculate yesterday's ATR (already done in filtering, but get it again)
+        yesterday_atr = self._get_yesterday_atr(ticker)
+        
+        # Get sector info
+        sector = stock_data.get('sector', 'Unknown')
+        
+        # Prepare news summary
+        news = stock_data.get('news', [])
+        if not news:
+            return None
+        
+        news_summary = "\n".join([
+            f"- {item.get('title', 'No title')} ({item.get('published_utc', 'Unknown time')})"
+            for item in news[:5]  # Top 5 news items
+        ])
+        
+        # Get VIX (market volatility indicator)
+        vix = self._get_vix()
+        
+        # Create LLM prompt
+        prompt = f"""You are a volatility prediction expert for day trading.
+
+Analyze this stock and predict if it will have sufficient intraday volatility TODAY.
+
+Ticker: {ticker}
+Yesterday's ATR: {yesterday_atr:.2f}%
+Sector: {sector}
+Current Market VIX: {vix:.2f}
+
+News Today (morning):
+{news_summary}
+
+Question: Will this stock have an ATR > 1.5% TODAY (9:30 AM - 4:00 PM ET)?
+
+Consider:
+1. Catalyst Strength: Is this major news (FDA approval, earnings beat, acquisition)?
+2. News Timing: Is it breaking NOW (high impact) or old news (already priced in)?
+3. Sector Volatility: Does {sector} typically move on this type of news?
+4. Market Attention: Will traders notice this? High volume potential?
+5. Historical Pattern: Yesterday's ATR was {yesterday_atr:.2f}% - will today exceed this?
+
+Respond ONLY with valid JSON (no markdown, no explanation):
+{{
+  "predicted_atr": <float 0-10>,
+  "confidence": <float 0-1>,
+  "volatility_level": "<Low/Medium/High>",
+  "reasoning": "<2-3 sentences why>"
+}}"""
+        
+        try:
+            # Try DeepSeek first (cheaper)
+            llm = ChatDeepSeek(model="deepseek-reasoner", api_key=DEEPSEEK_API_KEY, temperature=0)
+            response = llm.invoke(prompt)
+            
+            # Parse response
+            content = response.content.strip()
+            
+            # Remove markdown code blocks if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(content)
+            
+            # Add ticker to result
+            result['ticker'] = ticker
+            result['yesterday_atr'] = yesterday_atr
+            result['sector'] = sector
+            
+            return result
+            
+        except Exception as e:
+            self.log(logging.WARNING, f"ATR prediction failed for {ticker}: {e}")
+            return None
+    
+    def _get_yesterday_atr(self, ticker: str) -> float:
+        """Calculate yesterday's ATR for a stock."""
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="1mo", interval="1d")
+            
+            if hist.empty or len(hist) < 14:
+                return 0.0
+            
+            # Calculate ATR
+            high_low = hist['High'] - hist['Low']
+            high_close = abs(hist['High'] - hist['Close'].shift())
+            low_close = abs(hist['Low'] - hist['Close'].shift())
+            
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = true_range.rolling(window=14).mean().iloc[-1]
+            
+            current_price = hist['Close'].iloc[-1]
+            atr_pct = (atr / current_price) * 100
+            
+            return round(atr_pct, 2)
+            
+        except Exception as e:
+            self.log(logging.DEBUG, f"Error calculating ATR for {ticker}: {e}")
+            return 0.0
+    
+    def _get_vix(self) -> float:
+        """Get current VIX (volatility index) level."""
+        try:
+            vix = yf.Ticker("^VIX")
+            hist = vix.history(period="1d")
+            if not hist.empty:
+                return round(hist['Close'].iloc[-1], 2)
+        except:
+            pass
+        return 18.0  # Default assumption
+
+
+class TickerValidatorAgent(BaseDayTraderAgent):
+    """
+    Validates tickers with IBKR to ensure they can actually be traded.
+    Checks: contract exists, bid/ask data available, spread acceptable, volume sufficient.
+    Integrates with knowledge graph to skip known failures.
+    """
+    def __init__(self, orchestrator):
+        super().__init__(orchestrator, "TickerValidatorAgent")
+        self.ib = None
+        self.log(logging.INFO, "Ticker Validator Agent initialized.")
+    
+    def run(self, watchlist: list) -> list:
+        """
+        Validate tickers with IBKR and return only tradeable ones.
+        
+        Args:
+            watchlist: List of top-ranked stocks from WatchlistAnalystAgent
+            
+        Returns:
+            List of validated tickers (dicts with ticker + validation info)
+        """
+        self.log(logging.INFO, f"--- [PHASE 1.5] Validating {len(watchlist)} tickers with IBKR ---")
+        
+        # Connect to IBKR
+        try:
+            self.ib = IB()
+            self.ib.connect('127.0.0.1', 4001, clientId=2)
+            self.log(logging.INFO, "Connected to IBKR successfully.")
+        except Exception as e:
+            self.log(logging.CRITICAL, f"Failed to connect to IBKR: {e}")
+            return []
+        
+        validated = []
+        
+        for item in watchlist:
+            ticker = item.get('ticker', item) if isinstance(item, dict) else item
+            
+            # Check memory: Has this ticker failed recently?
+            if self._has_failed_recently(ticker):
+                self.log(logging.WARNING, f"❌ {ticker}: Previously failed validation (skipping)")
+                continue
+            
+            # Validate with IBKR
+            validation = self._validate_ticker(ticker)
+            
+            if validation['valid']:
+                validated.append({
+                    'ticker': ticker,
+                    'spread': validation['spread'],
+                    'volume': validation['volume'],
+                    'original_data': item
+                })
+                self.log(logging.INFO, 
+                        f"✅ {ticker}: Valid (spread={validation['spread']:.2f}%, "
+                        f"vol={validation['volume']:,})")
+            else:
+                self.log(logging.WARNING, f"❌ {ticker}: {validation['reason']}")
+                # Store failure in memory
+                self._record_failure(ticker, validation['reason'])
+        
+        # Disconnect from IBKR
+        self.ib.disconnect()
+        self.log(logging.INFO, f"Validation complete. {len(validated)}/{len(watchlist)} tickers are tradeable.")
+        
+        return validated
+    
+    def _validate_ticker(self, ticker: str) -> dict:
+        """Validate a single ticker with IBKR."""
+        try:
+            # Create contract
+            contract = Stock(ticker, 'SMART', 'USD')
+            
+            # Request contract details
+            details = self.ib.reqContractDetails(contract)
+            if not details:
+                return {"valid": False, "reason": "No contract details found"}
+            
+            # Qualify contract
+            self.ib.qualifyContracts(contract)
+            
+            # Get market data
+            ticker_data = self.ib.reqMktData(contract, '', False, False)
+            self.ib.sleep(2)  # Wait for data to populate
+            
+            # Check bid/ask
+            if not ticker_data.bid or not ticker_data.ask or ticker_data.bid <= 0:
+                return {"valid": False, "reason": "No bid/ask data"}
+            
+            # Calculate spread
+            spread_pct = (ticker_data.ask - ticker_data.bid) / ticker_data.bid * 100
+            
+            if spread_pct > 2.0:
+                return {"valid": False, "reason": f"Spread {spread_pct:.2f}% too wide"}
+            
+            # Check volume (if available)
+            volume = ticker_data.volume if ticker_data.volume else 0
+            
+            if volume > 0 and volume < 10000:
+                return {"valid": False, "reason": f"Volume {volume} too low"}
+            
+            # Cancel market data subscription
+            self.ib.cancelMktData(contract)
+            
+            return {
+                "valid": True,
+                "spread": round(spread_pct, 3),
+                "volume": int(volume) if volume else 0
+            }
+            
+        except Exception as e:
+            return {"valid": False, "reason": f"Error: {str(e)[:50]}"}
+    
+    def _has_failed_recently(self, ticker: str) -> bool:
+        """Check if ticker has failed validation recently (via knowledge graph)."""
+        # TODO: Integrate with knowledge graph to check for recent failures
+        # For now, don't skip any tickers (first run establishes baseline)
+        return False
+    
+    def _record_failure(self, ticker: str, reason: str):
+        """Record validation failure in knowledge graph."""
+        # TODO: Integrate with knowledge graph to store failures
+        # For now, just log the failure
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.log(logging.DEBUG, f"Would record in memory: {ticker} failed validation on {today}: {reason}")
+
+
+class PreMarketMomentumAgent(BaseDayTraderAgent):
+    """
+    Analyzes pre-market movement (8:00-9:25 AM) for validated tickers.
+    Ranks stocks by momentum to prioritize which to trade first at 9:30 AM.
+    """
+    def __init__(self, orchestrator):
+        super().__init__(orchestrator, "PreMarketMomentumAgent")
+        self.ib = None
+        self.log(logging.INFO, "Pre-Market Momentum Agent initialized.")
+    
+    def run(self, validated_tickers: list) -> list:
+        """
+        Analyze pre-market momentum and rank tickers.
+        
+        Args:
+            validated_tickers: List of validated tickers from TickerValidatorAgent
+            
+        Returns:
+            List of tickers ranked by momentum score (highest first)
+        """
+        self.log(logging.INFO, f"--- [PHASE 1.75] Analyzing pre-market momentum for {len(validated_tickers)} tickers ---")
+        
+        # Connect to IBKR if not connected
+        if not self.ib or not self.ib.isConnected():
+            try:
+                self.ib = IB()
+                self.ib.connect('127.0.0.1', 4001, clientId=2)
+                self.log(logging.INFO, "Connected to IBKR for pre-market analysis.")
+            except Exception as e:
+                self.log(logging.ERROR, f"Failed to connect to IBKR: {e}")
+                # Return unranked list if can't connect
+                return validated_tickers
+        
+        ranked = []
+        
+        for item in validated_tickers:
+            ticker = item['ticker']
+            
+            # Get pre-market data
+            momentum_data = self._analyze_premarket(ticker)
+            
+            if momentum_data:
+                item['premarket_change'] = momentum_data['pct_change']
+                item['premarket_volume_ratio'] = momentum_data['volume_ratio']
+                item['momentum_score'] = momentum_data['score']
+                ranked.append(item)
+                
+                self.log(logging.INFO,
+                        f"{ticker}: Pre-market {momentum_data['pct_change']:+.2f}%, "
+                        f"Vol {momentum_data['volume_ratio']:.1f}x, "
+                        f"Score: {momentum_data['score']:.1f}/10")
+            else:
+                # No pre-market data, give neutral score
+                item['momentum_score'] = 5.0
+                ranked.append(item)
+        
+        # Sort by momentum score (highest first)
+        ranked.sort(key=lambda x: x['momentum_score'], reverse=True)
+        
+        # Disconnect
+        if self.ib and self.ib.isConnected():
+            self.ib.disconnect()
+        
+        top_ticker = ranked[0]['ticker'] if ranked else 'None'
+        self.log(logging.INFO, f"Pre-market analysis complete. Top momentum: {top_ticker}")
+        
+        return ranked
+    
+    def _analyze_premarket(self, ticker: str) -> dict:
+        """Analyze pre-market movement for a single ticker."""
+        try:
+            # Get pre-market data using yfinance (easier than IBKR for historical)
+            stock = yf.Ticker(ticker)
+            
+            # Get today's data with pre/post market
+            hist = stock.history(period="1d", interval="1m", prepost=True)
+            
+            if hist.empty:
+                return None
+            
+            # Filter to pre-market hours (4:00 AM - 9:30 AM ET)
+            # yfinance uses UTC, so we need to be careful
+            # For simplicity, use the data we have
+            
+            # Get yesterday's close
+            hist_day = stock.history(period="5d", interval="1d")
+            if len(hist_day) < 2:
+                return None
+            
+            yesterday_close = hist_day['Close'].iloc[-2]
+            
+            # Get current pre-market price (most recent)
+            current_price = hist['Close'].iloc[-1]
+            
+            # Calculate % change
+            pct_change = ((current_price - yesterday_close) / yesterday_close) * 100
+            
+            # Get pre-market volume
+            premarket_volume = hist['Volume'].sum()
+            
+            # Get average daily volume
+            avg_volume = hist_day['Volume'].mean()
+            
+            # Calculate volume ratio
+            volume_ratio = premarket_volume / (avg_volume / 6.5) if avg_volume > 0 else 1.0  # 6.5 hours in trading day
+            
+            # Calculate momentum score (0-10)
+            # Factors: price change (50%), volume surge (30%), absolute change (20%)
+            score = (
+                min(abs(pct_change) / 5.0, 1.0) * 5.0 +  # Max 5 points for 5%+ move
+                min(volume_ratio / 3.0, 1.0) * 3.0 +      # Max 3 points for 3x volume
+                min(abs(pct_change) / 10.0, 1.0) * 2.0    # Max 2 points for magnitude
+            )
+            
+            return {
+                'pct_change': round(pct_change, 2),
+                'volume_ratio': round(volume_ratio, 2),
+                'score': round(score, 1)
+            }
+            
+        except Exception as e:
+            self.log(logging.DEBUG, f"Pre-market analysis failed for {ticker}: {e}")
+            return None
 
 
 class IntradayTraderAgent(BaseDayTraderAgent):
