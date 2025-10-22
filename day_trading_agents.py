@@ -1,5 +1,6 @@
 """
 Contains the specialized agents for the Day-Trading Bot.
+Now includes autonomous capabilities: observability, self-evaluation, and continuous improvement.
 """
 
 import logging
@@ -20,6 +21,11 @@ import yfinance as yf
 from ib_insync import IB, Stock, MarketOrder, util
 import pandas_ta as ta
 from market_hours import is_market_open
+
+# Autonomous system imports
+from observability import get_database, get_tracer
+from self_evaluation import PerformanceAnalyzer, SelfHealingMonitor
+from continuous_improvement import ContinuousImprovementEngine
 
 # --- Setup and Configuration ---
 load_dotenv()
@@ -118,11 +124,16 @@ class DataAggregatorAgent(BaseDayTraderAgent):
             results = await asyncio.gather(*tasks)
 
         for data in results:
-            if data and not data.get("error") and data.get("news"):
+            # MUST have news for LLM to analyze catalyst-driven volatility
+            # Check if news list exists AND is not empty
+            if data and not data.get("error") and data.get("news") and len(data.get("news", [])) > 0:
                 all_market_data.append(data)
-            elif data and not data.get("news"):
-                self.log(logging.DEBUG, f"Discarding {data.get('ticker')} due to no news.")
+            elif data and (not data.get("news") or len(data.get("news", [])) == 0):
+                self.log(logging.DEBUG, f"Discarding {data.get('ticker')} - no news found in last 3 days (LLM needs catalyst info).")
+            elif data and data.get("error"):
+                self.log(logging.DEBUG, f"Discarding {data.get('ticker')} due to error: {data.get('error')}")
         
+        self.log(logging.INFO, f"Successfully collected data for {len(all_market_data)} stocks with news (from {len(filtered_tickers)} after ATR filter).")
         return all_market_data
 
     async def _fetch_target_tickers(self, session):
@@ -130,92 +141,118 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         all_tickers = set()
         exchanges_to_query = ["nyse", "nasdaq"]
 
+        # FMP has a 1000 result limit, so we'll split by market cap ranges to get all stocks
+        # $50M-$500M, $500M-$1B, $1B-$2B
+        market_cap_ranges = [
+            (50000000, 500000000),
+            (500000000, 1000000000),
+            (1000000000, 2000000000)
+        ]
+
         for exchange in exchanges_to_query:
             self.log(logging.INFO, f"Querying for exchange: {exchange.upper()}")
-            params = {
-                "marketCapMoreThan": 50000000,
-                "marketCapLowerThan": 2000000000,  # Raised to $2B for better liquidity
-                "priceMoreThan": 1,
-                "volumeMoreThan": 50000,
-                "isEtf": "false",
-                "isFund": "false",
-                "country": "US",
-                "exchange": exchange,
-                "apikey": FMP_API_KEY
-            }
-            screener_url = "https://financialmodelingprep.com/api/v3/stock-screener"
-            try:
-                async with session.get(screener_url, params=params) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    if data:
-                        page_tickers = {item['symbol'] for item in data}
-                        all_tickers.update(page_tickers)
-                        self.log(logging.INFO, f"Found {len(page_tickers)} tickers for {exchange.upper()}.")
-                    else:
-                        self.log(logging.WARNING, f"No tickers returned for {exchange.upper()}.")
+            
+            for cap_min, cap_max in market_cap_ranges:
+                params = {
+                    "marketCapMoreThan": cap_min,
+                    "marketCapLowerThan": cap_max,
+                    "priceMoreThan": 1,
+                    "volumeMoreThan": 50000,
+                    "isEtf": "false",
+                    "isFund": "false",
+                    "country": "US",
+                    "exchange": exchange,
+                    "apikey": FMP_API_KEY
+                }
+                screener_url = "https://financialmodelingprep.com/api/v3/stock-screener"
+                try:
+                    async with session.get(screener_url, params=params) as response:
+                        response.raise_for_status()
+                        data = await response.json()
+                        if data:
+                            page_tickers = {item['symbol'] for item in data}
+                            all_tickers.update(page_tickers)
+                            self.log(logging.DEBUG, f"Found {len(page_tickers)} tickers for {exchange.upper()} (${cap_min/1e6:.0f}M-${cap_max/1e6:.0f}M).")
+                        else:
+                            self.log(logging.DEBUG, f"No tickers returned for {exchange.upper()} (${cap_min/1e6:.0f}M-${cap_max/1e6:.0f}M).")
 
-            except Exception as e:
-                self.log(logging.ERROR, f"Could not fetch tickers from FMP screener for {exchange.upper()}: {e}")
-                continue
+                except Exception as e:
+                    self.log(logging.ERROR, f"Could not fetch tickers from FMP screener for {exchange.upper()} (${cap_min/1e6:.0f}M-${cap_max/1e6:.0f}M): {e}")
+                    continue
+            
+            self.log(logging.INFO, f"Found {len([t for t in all_tickers])} total unique tickers so far for {exchange.upper()}.")
         
         self.log(logging.INFO, f"Found a total of {len(all_tickers)} unique tickers across all exchanges.")
         return list(all_tickers)
 
     async def _filter_by_atr(self, tickers: list) -> list:
         """
-        Filter tickers by yesterday's ATR (Average True Range).
+        Filter tickers by yesterday's ATR (Average True Range) - PARALLEL VERSION.
         Only keep stocks with historical volatility > 1.0%.
         This pre-screens out dead/quiet stocks before expensive LLM analysis.
         """
         from datetime import datetime, timedelta
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        self.log(logging.INFO, f"Calculating yesterday's ATR for {len(tickers)} tickers in parallel...")
         
         filtered = []
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         
-        self.log(logging.INFO, f"Calculating yesterday's ATR for {len(tickers)} tickers...")
+        # Use ThreadPoolExecutor for parallel yfinance calls (blocking I/O)
+        max_workers = 15  # Optimal from testing (5-30 range tested)
         
-        # Process in batches to avoid overwhelming yfinance
-        batch_size = 50
-        for i in range(0, len(tickers), batch_size):
-            batch = tickers[i:i+batch_size]
+        def calculate_atr_for_ticker(ticker):
+            """Calculate ATR for a single ticker"""
+            try:
+                # Use yfinance for historical data (faster than IBKR for bulk queries)
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="1mo", interval="1d")
+                
+                if hist.empty or len(hist) < 14:
+                    return None
+                
+                # Calculate ATR (14-day period)
+                high_low = hist['High'] - hist['Low']
+                high_close = abs(hist['High'] - hist['Close'].shift())
+                low_close = abs(hist['Low'] - hist['Close'].shift())
+                
+                true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr = true_range.rolling(window=14).mean().iloc[-1]
+                
+                # Convert to percentage
+                current_price = hist['Close'].iloc[-1]
+                atr_pct = (atr / current_price) * 100
+                
+                # Return ticker if ATR > 1.0%
+                if atr_pct >= 1.0:
+                    return (ticker, atr_pct)
+                else:
+                    return None
+                
+            except Exception as e:
+                return None
+        
+        # Run in executor to avoid blocking async loop
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            futures = {executor.submit(calculate_atr_for_ticker, ticker): ticker for ticker in tickers}
             
-            for ticker in batch:
-                try:
-                    # Use yfinance for historical data (faster than IBKR for bulk queries)
-                    stock = yf.Ticker(ticker)
-                    hist = stock.history(period="1mo", interval="1d")
-                    
-                    if hist.empty or len(hist) < 14:
-                        self.log(logging.DEBUG, f"{ticker}: Insufficient historical data")
-                        continue
-                    
-                    # Calculate ATR (14-day period)
-                    high_low = hist['High'] - hist['Low']
-                    high_close = abs(hist['High'] - hist['Close'].shift())
-                    low_close = abs(hist['Low'] - hist['Close'].shift())
-                    
-                    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-                    atr = true_range.rolling(window=14).mean().iloc[-1]
-                    
-                    # Convert to percentage
-                    current_price = hist['Close'].iloc[-1]
-                    atr_pct = (atr / current_price) * 100
-                    
-                    # Filter: Only keep if ATR > 1.0%
-                    if atr_pct >= 1.0:
-                        filtered.append(ticker)
-                        self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% ✅")
-                    else:
-                        self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% (too low)")
-                    
-                except Exception as e:
-                    self.log(logging.DEBUG, f"{ticker}: Error calculating ATR: {e}")
-                    continue
-            
-            # Small delay between batches
-            await asyncio.sleep(0.5)
+            # Process as they complete
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    ticker, atr_pct = result
+                    filtered.append(ticker)
+                    self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% ✅")
+                
+                completed += 1
+                # Log progress every 100 tickers
+                if completed % 100 == 0:
+                    self.log(logging.INFO, f"Progress: {completed}/{len(tickers)} tickers processed ({len(filtered)} passed ATR filter)")
         
+        self.log(logging.INFO, f"ATR filtering complete: {len(filtered)} tickers passed (from {len(tickers)})")
         return filtered
 
     async def _fetch_stock_data_with_semaphore(self, session, ticker, semaphore):
@@ -229,19 +266,13 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         news_items = []
         news_source = "None"
 
-        # 1. Try Polygon
+        # Use ONLY Polygon for news (no yfinance fallback due to rate limits)
         polygon_data = await self._fetch_polygon_news(session, ticker)
         if polygon_data.get("news"):
             news_items = polygon_data["news"]
             news_source = "Polygon"
-        
-        # 2. Fallback to yfinance
-        if not news_items:
-            self.log(logging.DEBUG, f"No news from Polygon for {ticker}. Trying yfinance.")
-            yfinance_data = await self._fetch_yfinance_news(ticker)
-            if yfinance_data.get("news"):
-                news_items = yfinance_data["news"]
-                news_source = "yfinance"
+        else:
+            self.log(logging.DEBUG, f"No news from Polygon for {ticker}. Skipping news.")
 
         self.log(logging.DEBUG, f"Found {len(news_items)} news items for {ticker} from {news_source}.")
 
@@ -273,19 +304,26 @@ class DataAggregatorAgent(BaseDayTraderAgent):
 
             profile_data = profile_data_list[0]
             
+            # Income statement is optional - many stocks don't have it (SPACs, financials, etc.)
             income_data_list = await income_resp.json()
-            if not income_data_list:
-                self.log(logging.ERROR, f"[FMP] No income statement for {ticker}.")
-                return {"error": "No income statement"}
-
-            income_data = income_data_list[0]
+            revenue = 0
+            net_income = 0
+            
+            if income_data_list:
+                income_data = income_data_list[0]
+                revenue = income_data.get("revenue", 0)
+                net_income = income_data.get("netIncome", 0)
+            else:
+                self.log(logging.DEBUG, f"[FMP] No income statement for {ticker} (using profile data only).")
 
             return {
                 "price": profile_data.get("price", 0), 
                 "market_cap": profile_data.get("mktCap", 0),
                 "company_name": profile_data.get("companyName"),
-                "revenue": income_data.get("revenue", 0), 
-                "net_income": income_data.get("netIncome", 0)
+                "sector": profile_data.get("sector", "Unknown"),
+                "industry": profile_data.get("industry", "Unknown"),
+                "revenue": revenue, 
+                "net_income": net_income
             }
         except Exception as e:
             self.log(logging.ERROR, f"[FMP] Error for {ticker}: {e}")
@@ -389,11 +427,11 @@ class WatchlistAnalystAgent(BaseDayTraderAgent):
         - Price Volatility: Does the stock show signs of high beta or recent sharp price swings?
         - Volume Patterns: Is there unusual or increasing volume that suggests growing trader interest?
         - Historical Volatility: Based on the data, does this stock typically move 2%+ intraday?
-        - Micro-Cap Dynamics: Stocks under $350M market cap tend to be more volatile - factor this in
+        - Small/Mid-Cap Dynamics: Stocks under $2B market cap tend to be more volatile - factor this in
         
         **3. FUNDAMENTAL RISK ASSESSMENT**
         - Revenue & Profitability: Check for red flags (zero revenue, massive losses, negative trends)
-        - Market Cap & Liquidity: Is the market cap between $50M-$350M (our target range)?
+        - Market Cap & Liquidity: Is the market cap between $50M-$2B (our target range)?
         - Debt & Financial Health: Are there signs of financial distress that could cause unpredictable swings?
         - Business Model: Does the company have a clear business that traders can understand?
         
@@ -419,7 +457,7 @@ class WatchlistAnalystAgent(BaseDayTraderAgent):
         {{
           "candidate_decision": "GOOD",
           "confidence_score": 0.85,
-          "reasoning": "Strong catalyst: FDA approval news from yesterday with 10+ articles. Stock has history of 3-5% daily swings. $120M market cap in our target range. Moderate revenue ($50M) with growing trajectory. High volume spike (3x average) indicates trader interest. Clear entry opportunity at market open."
+          "reasoning": "Strong catalyst: FDA approval news from yesterday with 10+ articles. Stock has history of 3-5% daily swings. $850M market cap in our target range with good liquidity. Moderate revenue ($150M) with growing trajectory. High volume spike (3x average) indicates trader interest. Clear entry opportunity at market open."
         }}
         """
 
@@ -536,8 +574,10 @@ class ATRPredictorAgent(BaseDayTraderAgent):
             List of stocks with predicted ATR > 1.5%, sorted by confidence
         """
         self.log(logging.INFO, f"--- [PHASE 0.5] ATR Prediction for {len(market_data)} stocks ---")
+        self.log(logging.INFO, f"Analyzing {len(market_data)} stocks in parallel with 15 workers...")
         
         predictions = []
+        processed_count = 0
         
         # Use parallel processing for speed
         with ThreadPoolExecutor(max_workers=15) as executor:
@@ -548,6 +588,12 @@ class ATRPredictorAgent(BaseDayTraderAgent):
             
             for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
+                processed_count += 1
+                
+                # Log progress every 50 stocks
+                if processed_count % 50 == 0:
+                    self.log(logging.INFO, f"Progress: {processed_count}/{len(market_data)} stocks analyzed...")
+                
                 try:
                     result = future.result()
                     if result and result.get('predicted_atr', 0) >= 1.5:
@@ -711,7 +757,9 @@ class TickerValidatorAgent(BaseDayTraderAgent):
         # Connect to IBKR
         try:
             self.ib = IB()
-            self.ib.connect('127.0.0.1', 4001, clientId=2)
+            # Python 3.12 fix: Use util.run() to handle event loop properly
+            import ib_insync.util as ib_util
+            ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=2))
             self.log(logging.INFO, "Connected to IBKR successfully.")
         except Exception as e:
             self.log(logging.CRITICAL, f"Failed to connect to IBKR: {e}")
@@ -762,12 +810,11 @@ class TickerValidatorAgent(BaseDayTraderAgent):
             if not details:
                 return {"valid": False, "reason": "No contract details found"}
             
-            # Qualify contract
-            self.ib.qualifyContracts(contract)
+            # Contract will be automatically qualified by reqContractDetails
             
             # Get market data
             ticker_data = self.ib.reqMktData(contract, '', False, False)
-            self.ib.sleep(2)  # Wait for data to populate
+            time.sleep(2)  # Wait for data to populate
             
             # Check bid/ask
             if not ticker_data.bid or not ticker_data.ask or ticker_data.bid <= 0:
@@ -838,7 +885,9 @@ class PreMarketMomentumAgent(BaseDayTraderAgent):
         if not self.ib or not self.ib.isConnected():
             try:
                 self.ib = IB()
-                self.ib.connect('127.0.0.1', 4001, clientId=2)
+                # Python 3.12 fix: Use util.run() to handle event loop properly
+                import ib_insync.util as ib_util
+                ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=2))
                 self.log(logging.INFO, "Connected to IBKR for pre-market analysis.")
             except Exception as e:
                 self.log(logging.ERROR, f"Failed to connect to IBKR: {e}")
@@ -954,7 +1003,20 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.account_summary = {}
         self.capital_per_stock = 0
         self.positions = {} # To track open positions: { 'symbol': {...} }
+        
+        # Autonomous system components
+        self.db = get_database()
+        self.tracer = get_tracer()
+        self.performance_analyzer = PerformanceAnalyzer(self.agent_name)
+        self.health_monitor = SelfHealingMonitor(self.agent_name)
+        self.improvement_engine = ContinuousImprovementEngine(self.agent_name)
+        
+        # Health check interval (check every 5 minutes)
+        self.last_health_check = time.time()
+        self.health_check_interval = 300  # seconds
+        
         self.log(logging.INFO, f"Intraday Trader Agent initialized with {self.allocation*100}% capital allocation. Paper trading: {self.paper_trade}")
+        self.log(logging.INFO, "Autonomous systems enabled: Observability, Self-Evaluation, Continuous Improvement")
 
     def _connect_to_brokerage(self):
         """Connects to Interactive Brokers."""
@@ -968,9 +1030,9 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             client_id = 2  # Changed to 2 to avoid conflict with other connections
             self.log(logging.INFO, f"Attempting connection to 127.0.0.1:{port} with clientId={client_id}...")
             
-            # Use util.run() to properly handle the event loop for ib_insync
-            # This ensures the async connection is properly awaited
-            util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id))
+            # Python 3.12 fix: Use util.run() with proper event loop handling
+            import ib_insync.util as ib_util
+            ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id))
             
             # Verify connection
             if not self.ib.isConnected():
@@ -1012,7 +1074,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         try:
             # Fetch account summary
             self.ib.reqAccountSummary()
-            self.ib.sleep(2) # Give it a moment to populate - use ib.sleep for event loop compatibility
+            time.sleep(2) # Give it a moment to populate
             acc_summary_list = self.ib.accountSummary()
             self.account_summary = {item.tag: item.value for item in acc_summary_list}
 
@@ -1038,6 +1100,47 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.log(logging.ERROR, f"Error calculating capital: {e}")
             self.capital_per_stock = 0
 
+    def _sync_positions_from_ibkr(self):
+        """
+        Syncs the in-memory positions dictionary with actual IBKR positions.
+        This is critical for recovering state after bot restarts.
+        """
+        try:
+            self.log(logging.INFO, "Syncing positions from IBKR account...")
+            ibkr_positions = self.ib.positions()
+            
+            if not ibkr_positions:
+                self.log(logging.INFO, "No open positions found in IBKR account.")
+                return
+            
+            synced_count = 0
+            for pos in ibkr_positions:
+                symbol = pos.contract.symbol
+                
+                # Only sync positions for stocks in our watchlist
+                watchlist_symbols = [item.get('ticker') for item in self.watchlist_data]
+                if symbol in watchlist_symbols:
+                    # Create position entry in our tracking dictionary
+                    self.positions[symbol] = {
+                        "quantity": abs(pos.position),  # Use absolute value
+                        "entry_price": pos.avgCost,
+                        "contract": Stock(symbol, 'SMART', 'USD'),
+                        "atr_pct": None  # Unknown from IBKR, will be recalculated
+                    }
+                    synced_count += 1
+                    self.log(logging.INFO, f"SYNCED position: {symbol} - {abs(pos.position)} shares @ ${pos.avgCost:.4f}")
+                else:
+                    self.log(logging.WARNING, f"Found position for {symbol} ({pos.position} shares @ ${pos.avgCost:.4f}) but it's NOT in today's watchlist. Will not manage this position.")
+            
+            if synced_count > 0:
+                self.log(logging.INFO, f"Successfully synced {synced_count} positions from IBKR that match watchlist.")
+            else:
+                self.log(logging.INFO, "No watchlist positions found in IBKR account to sync.")
+                
+        except Exception as e:
+            self.log(logging.ERROR, f"Error syncing positions from IBKR: {e}")
+            import traceback
+            self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
 
     def _run_trading_loop(self):
         """
@@ -1070,46 +1173,57 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         # Using delayed data (reqMarketDataType=3) which is free
         self.ib.reqMarketDataType(3)  # 3 = delayed data (free)
         
-        for contract in contracts_for_data:
-            # Qualify the contract first to ensure it's valid
-            try:
-                self.log(logging.INFO, f"Attempting to qualify contract for {contract.symbol}...")
-                qualified = self.ib.qualifyContracts(contract)
-                if qualified:
-                    self.log(logging.INFO, f"[OK] Qualified contract for {contract.symbol}: {qualified[0].primaryExchange}")
-                else:
-                    self.log(logging.WARNING, f"[FAIL] Could not qualify contract for {contract.symbol}")
-            except Exception as e:
-                self.log(logging.ERROR, f"[ERROR] Error qualifying contract for {contract.symbol}: {e}")
-
+        # Contracts will be automatically qualified by IBKR when we request data
+        self.log(logging.INFO, f"Preparing to fetch data for {len(contracts_for_data)} stocks...")
+        self.log(logging.INFO, f"Contracts: {[c.symbol for c in contracts_for_data]}")
+        
         try:
-            # In a real scenario, this would loop until market close.
-            # For this test, we'll run it for a short duration (e.g., 5 minutes).
+            # Run until market close (no time limit)
             loop_start_time = time.time()
-            loop_duration_seconds = 300 # 5 minutes
             
-            self.log(logging.INFO, f"Entering trading loop for {loop_duration_seconds}s or until market close...")
+            self.log(logging.INFO, f"Entering trading loop - will run until market close...")
+            self.log(logging.INFO, f"Loop start time: {loop_start_time}, Market open: {is_market_open()}")
             
-            while time.time() - loop_start_time < loop_duration_seconds and is_market_open():
+            while is_market_open():
                 self.log(logging.INFO, "Trading loop iteration starting...")
-                self.ib.sleep(5) # Poll for data every 5 seconds
+                self.log(logging.INFO, f"Processing {len(contracts_for_data)} contracts...")
+                
+                # AUTONOMOUS: Periodic health check
+                if time.time() - self.last_health_check > self.health_check_interval:
+                    health_status = self.health_monitor.check_health(self)
+                    if health_status['status'] == 'critical':
+                        self.log(logging.ERROR, f"Critical health issues detected: {health_status['issues']}")
+                        # Attempt self-healing
+                        for issue in health_status['issues']:
+                            if 'IBKR connection lost' in issue:
+                                self.health_monitor.attempt_healing(self, 'ibkr_disconnected')
+                    self.last_health_check = time.time()
                 
                 for contract in contracts_for_data: # Use the exchange-specific contract for data
                     try:
                         self.log(logging.INFO, f"Fetching historical data for {contract.symbol}...")
                         
                         # Get historical data to calculate indicators - try IBKR first, fallback to Polygon
+                        # Request 2 days of data to ensure we have enough bars for RSI_14 calculation
                         df = None
                         try:
-                            bars = self.ib.reqHistoricalData(
-                                contract,
-                                endDateTime='',
-                                durationStr='1 D',
-                                barSizeSetting='1 min',
-                                whatToShow='TRADES',
-                                useRTH=True,
-                                formatDate=1
-                            )
+                            try:
+                                bars = self.ib.reqHistoricalData(
+                                    contract,
+                                    endDateTime='',
+                                    durationStr='2 D',
+                                    barSizeSetting='1 min',
+                                    whatToShow='TRADES',
+                                    useRTH=True,
+                                    formatDate=1
+                                )
+                            except KeyboardInterrupt:
+                                self.log(logging.INFO, f"Bot interrupted by user. Exiting gracefully...")
+                                return
+                            except Exception as e:
+                                self.log(logging.ERROR, f"Error fetching IBKR data for {contract.symbol}: {e}")
+                                bars = None
+                                
                             if bars and len(bars) > 0:
                                 df = util.df(bars)
                                 # IBKR util.df() may not set DatetimeIndex properly, so fix it
@@ -1181,6 +1295,12 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             continue
                             
                         vwap = latest_data[vwap_col]
+                        
+                        # Check if RSI_14 exists in the dataframe
+                        if 'RSI_14' not in df.columns:
+                            self.log(logging.WARNING, f"RSI_14 not calculated for {contract.symbol} (need at least 14 bars). Skipping.")
+                            continue
+                            
                         rsi = latest_data['RSI_14']
                         atr = latest_data[atr_col] if atr_col and not pd.isna(latest_data[atr_col]) else None
                         current_price = latest_data['close']  # Get current price from latest bar
@@ -1216,19 +1336,45 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                     # *** Use SMART routing for the best order execution price ***
                                     trade_contract = Stock(contract.symbol, 'SMART', 'USD')
                                     order = MarketOrder('BUY', quantity)
-                                    trade = self.ib.placeOrder(trade_contract, order)
                                     
-                                    self.ib.sleep(1)
-                                    if trade.orderStatus.status == 'Filled':
-                                        self.positions[contract.symbol] = {
-                                            "quantity": trade.orderStatus.filled,
-                                            "entry_price": trade.orderStatus.avgFillPrice,
-                                            "contract": contract, # Store original data contract
-                                            "atr_pct": atr_pct  # Store ATR at entry for reference
-                                        }
-                                        self.log(logging.INFO, f"BOUGHT {trade.orderStatus.filled} shares of {contract.symbol} at ${trade.orderStatus.avgFillPrice:.2f}")
-                                    else:
-                                        self.log(logging.WARNING, f"Buy order for {contract.symbol} not filled immediately. Status: {trade.orderStatus.status}")
+                                    # AUTONOMOUS: Trace trade execution
+                                    with self.tracer.trace_trade_execution(contract.symbol, 'BUY'):
+                                        trade = self.ib.placeOrder(trade_contract, order)
+                                        time.sleep(1)
+                                        
+                                        if trade.orderStatus.status == 'Filled':
+                                            fill_price = trade.orderStatus.avgFillPrice
+                                            filled_quantity = trade.orderStatus.filled
+                                            
+                                            self.positions[contract.symbol] = {
+                                                "quantity": filled_quantity,
+                                                "entry_price": fill_price,
+                                                "contract": contract, # Store original data contract
+                                                "atr_pct": atr_pct  # Store ATR at entry for reference
+                                            }
+                                            
+                                            self.log(logging.INFO, f"BOUGHT {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
+                                            
+                                            # AUTONOMOUS: Log trade to database
+                                            capital = float(self.account_summary.get('NetLiquidation', 0))
+                                            self.db.log_trade({
+                                                'symbol': contract.symbol,
+                                                'action': 'BUY',
+                                                'quantity': filled_quantity,
+                                                'price': fill_price,
+                                                'agent_name': self.agent_name,
+                                                'reason': f'Entry signal: Price>${vwap:.2f} VWAP, RSI={rsi:.2f}<60, ATR={atr_pct:.2f}%',
+                                                'capital_at_trade': capital,
+                                                'position_size_pct': (filled_quantity * fill_price / capital * 100) if capital > 0 else 0,
+                                                'metadata': {
+                                                    'vwap': vwap,
+                                                    'rsi': rsi,
+                                                    'atr_pct': atr_pct,
+                                                    'current_price': current_price
+                                                }
+                                            })
+                                        else:
+                                            self.log(logging.WARNING, f"Buy order for {contract.symbol} not filled immediately. Status: {trade.orderStatus.status}")
                             else:
                                 # Log why we're NOT buying
                                 reasons = []
@@ -1249,26 +1395,97 @@ class IntradayTraderAgent(BaseDayTraderAgent):
 
                             if current_price >= profit_target:
                                 self.log(logging.INFO, f"PROFIT TARGET for {contract.symbol}: Price ${current_price:.2f} >= Target ${profit_target:.2f}. Selling.")
-                                trade_contract = Stock(contract.symbol, 'SMART', 'USD')
-                                order = MarketOrder('SELL', position['quantity'])
-                                self.ib.placeOrder(trade_contract, order)
-                                del self.positions[contract.symbol]
+                                
+                                # AUTONOMOUS: Trace sell execution
+                                with self.tracer.trace_trade_execution(contract.symbol, 'SELL'):
+                                    trade_contract = Stock(contract.symbol, 'SMART', 'USD')
+                                    order = MarketOrder('SELL', position['quantity'])
+                                    trade = self.ib.placeOrder(trade_contract, order)
+                                    time.sleep(1)
+                                    
+                                    if trade.orderStatus.status == 'Filled':
+                                        fill_price = trade.orderStatus.avgFillPrice
+                                        filled_quantity = trade.orderStatus.filled
+                                        profit_loss = (fill_price - entry_price) * filled_quantity
+                                        profit_loss_pct = ((fill_price - entry_price) / entry_price) * 100
+                                        
+                                        # AUTONOMOUS: Log trade to database
+                                        capital = float(self.account_summary.get('NetLiquidation', 0))
+                                        self.db.log_trade({
+                                            'symbol': contract.symbol,
+                                            'action': 'SELL',
+                                            'quantity': filled_quantity,
+                                            'price': fill_price,
+                                            'agent_name': self.agent_name,
+                                            'reason': f'Profit target: ${current_price:.2f} >= ${profit_target:.2f}',
+                                            'profit_loss': profit_loss,
+                                            'profit_loss_pct': profit_loss_pct,
+                                            'capital_at_trade': capital,
+                                            'metadata': {
+                                                'entry_price': entry_price,
+                                                'exit_price': fill_price,
+                                                'target_price': profit_target,
+                                                'current_price': current_price
+                                            }
+                                        })
+                                        
+                                        self.log(logging.INFO, f"SOLD {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f} for ${profit_loss:+.2f} P&L ({profit_loss_pct:+.2f}%)")
+                                    
+                                    del self.positions[contract.symbol]
                             
                             elif current_price <= stop_loss:
                                 self.log(logging.INFO, f"STOP LOSS for {contract.symbol}: Price ${current_price:.2f} <= Stop ${stop_loss:.2f}. Selling.")
-                                trade_contract = Stock(contract.symbol, 'SMART', 'USD')
-                                order = MarketOrder('SELL', position['quantity'])
-                                self.ib.placeOrder(trade_contract, order)
-                                del self.positions[contract.symbol]
+                                
+                                # AUTONOMOUS: Trace sell execution
+                                with self.tracer.trace_trade_execution(contract.symbol, 'SELL'):
+                                    trade_contract = Stock(contract.symbol, 'SMART', 'USD')
+                                    order = MarketOrder('SELL', position['quantity'])
+                                    trade = self.ib.placeOrder(trade_contract, order)
+                                    time.sleep(1)
+                                    
+                                    if trade.orderStatus.status == 'Filled':
+                                        fill_price = trade.orderStatus.avgFillPrice
+                                        filled_quantity = trade.orderStatus.filled
+                                        profit_loss = (fill_price - entry_price) * filled_quantity
+                                        profit_loss_pct = ((fill_price - entry_price) / entry_price) * 100
+                                        
+                                        # AUTONOMOUS: Log trade to database
+                                        capital = float(self.account_summary.get('NetLiquidation', 0))
+                                        self.db.log_trade({
+                                            'symbol': contract.symbol,
+                                            'action': 'SELL',
+                                            'quantity': filled_quantity,
+                                            'price': fill_price,
+                                            'agent_name': self.agent_name,
+                                            'reason': f'Stop loss: ${current_price:.2f} <= ${stop_loss:.2f}',
+                                            'profit_loss': profit_loss,
+                                            'profit_loss_pct': profit_loss_pct,
+                                            'capital_at_trade': capital,
+                                            'metadata': {
+                                                'entry_price': entry_price,
+                                                'exit_price': fill_price,
+                                                'stop_loss': stop_loss,
+                                                'current_price': current_price
+                                            }
+                                        })
+                                        
+                                        self.log(logging.INFO, f"SOLD {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f} for ${profit_loss:+.2f} P&L ({profit_loss_pct:+.2f}%)")
+                                    
+                                    del self.positions[contract.symbol]
 
                     except Exception as e_stock:
                         self.log(logging.ERROR, f"An error occurred while processing {contract.symbol}: {e_stock}")
                         continue # Move to the next stock
+                
+                # Sleep between iterations
+                time.sleep(5)
 
             self.log(logging.INFO, "Trading loop finished for the day.")
 
         except Exception as e:
             self.log(logging.ERROR, f"An error occurred in the trading loop: {e}")
+            import traceback
+            self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
         finally:
             # Cancel subscriptions
             for contract in contracts_for_data:
@@ -1278,30 +1495,75 @@ class IntradayTraderAgent(BaseDayTraderAgent):
     def _liquidate_positions(self):
         """
         Liquidates all open positions at the end of the trading day.
+        Checks both in-memory positions AND actual IBKR positions as safety net.
         """
-        if not self.positions:
-            self.log(logging.INFO, "No open positions to liquidate.")
-            return
+        # First, try to liquidate tracked positions
+        tracked_symbols = set()
+        if self.positions:
+            self.log(logging.INFO, f"Liquidating {len(self.positions)} tracked positions...")
+            for symbol, position in list(self.positions.items()):
+                tracked_symbols.add(symbol)
+                try:
+                    trade_contract = Stock(symbol, 'SMART', 'USD')
+                    order = MarketOrder('SELL', position['quantity'])
+                    trade = self.ib.placeOrder(trade_contract, order)
+                    time.sleep(1)
+                    
+                    if trade.orderStatus.status == 'Filled':
+                        entry_price = position['entry_price']
+                        exit_price = trade.orderStatus.avgFillPrice
+                        pnl = (exit_price - entry_price) * position['quantity']
+                        pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                        self.log(logging.INFO, f"LIQUIDATED {symbol}: Sold {position['quantity']} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+                        del self.positions[symbol]
+                    else:
+                        self.log(logging.WARNING, f"Liquidation order for {symbol} not filled immediately. Status: {trade.orderStatus.status}")
+                except Exception as e:
+                    self.log(logging.ERROR, f"Error liquidating tracked position {symbol}: {e}")
+        else:
+            self.log(logging.INFO, "No tracked positions to liquidate.")
         
-        self.log(logging.INFO, f"Liquidating {len(self.positions)} open positions...")
-        for symbol, position in list(self.positions.items()):
-            try:
-                trade_contract = Stock(symbol, 'SMART', 'USD')
-                order = MarketOrder('SELL', position['quantity'])
-                trade = self.ib.placeOrder(trade_contract, order)
-                self.ib.sleep(1)
+        # SAFETY NET: Check actual IBKR positions and liquidate any we missed
+        try:
+            self.log(logging.INFO, "Checking IBKR account for any untracked positions...")
+            ibkr_positions = self.ib.positions()
+            
+            watchlist_symbols = [item.get('ticker') for item in self.watchlist_data]
+            untracked_count = 0
+            
+            for pos in ibkr_positions:
+                symbol = pos.contract.symbol
                 
-                if trade.orderStatus.status == 'Filled':
-                    entry_price = position['entry_price']
-                    exit_price = trade.orderStatus.avgFillPrice
-                    pnl = (exit_price - entry_price) * position['quantity']
-                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-                    self.log(logging.INFO, f"LIQUIDATED {symbol}: Sold {position['quantity']} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
-                    del self.positions[symbol]
-                else:
-                    self.log(logging.WARNING, f"Liquidation order for {symbol} not filled immediately. Status: {trade.orderStatus.status}")
-            except Exception as e:
-                self.log(logging.ERROR, f"Error liquidating {symbol}: {e}")
+                # Only liquidate positions in our watchlist that weren't already sold
+                if symbol in watchlist_symbols and symbol not in tracked_symbols and pos.position > 0:
+                    untracked_count += 1
+                    self.log(logging.WARNING, f"FOUND UNTRACKED POSITION: {symbol} - {pos.position} shares @ ${pos.avgCost:.4f}. Liquidating now!")
+                    
+                    try:
+                        trade_contract = Stock(symbol, 'SMART', 'USD')
+                        order = MarketOrder('SELL', int(abs(pos.position)))
+                        trade = self.ib.placeOrder(trade_contract, order)
+                        time.sleep(1)
+                        
+                        if trade.orderStatus.status == 'Filled':
+                            exit_price = trade.orderStatus.avgFillPrice
+                            pnl = (exit_price - pos.avgCost) * abs(pos.position)
+                            pnl_pct = ((exit_price - pos.avgCost) / pos.avgCost) * 100
+                            self.log(logging.INFO, f"LIQUIDATED UNTRACKED {symbol}: Sold {abs(pos.position)} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+                        else:
+                            self.log(logging.WARNING, f"Liquidation order for untracked {symbol} not filled. Status: {trade.orderStatus.status}")
+                    except Exception as e:
+                        self.log(logging.ERROR, f"Error liquidating untracked position {symbol}: {e}")
+            
+            if untracked_count == 0:
+                self.log(logging.INFO, "No untracked watchlist positions found in IBKR account.")
+            else:
+                self.log(logging.WARNING, f"Liquidated {untracked_count} previously untracked positions!")
+                
+        except Exception as e:
+            self.log(logging.ERROR, f"Error checking IBKR positions for liquidation: {e}")
+            import traceback
+            self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
         
         self.log(logging.INFO, "Liquidation complete.")
 
@@ -1313,6 +1575,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self._connect_to_brokerage()
             self._load_watchlist()
             self._calculate_capital()
+            self._sync_positions_from_ibkr()  # CRITICAL: Sync existing positions before trading
 
             # Main trading window logic
             if is_market_open():
@@ -1325,5 +1588,25 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         finally:
             if self.ib and self.ib.isConnected():
                 self._liquidate_positions()
+                
+                # AUTONOMOUS: Run end-of-day improvement cycle
+                self.log(logging.INFO, "Running end-of-day performance analysis and improvement cycle...")
+                try:
+                    improvement_report = self.improvement_engine.daily_improvement_cycle()
+                    
+                    # Log summary of improvements
+                    if improvement_report.get('parameter_changes'):
+                        self.log(logging.INFO, f"Parameters updated based on performance: {list(improvement_report['parameter_changes'].keys())}")
+                    
+                    if improvement_report.get('llm_insights'):
+                        insights = improvement_report['llm_insights']
+                        if isinstance(insights, dict) and 'assessment' in insights:
+                            self.log(logging.INFO, f"LLM Assessment: {insights['assessment']}")
+                    
+                    self.log(logging.INFO, f"Daily improvement report saved to reports/improvement/")
+                    
+                except Exception as e_improve:
+                    self.log(logging.ERROR, f"Error in improvement cycle: {e_improve}")
+                
                 self.log(logging.INFO, "Disconnecting from Interactive Brokers.")
                 self.ib.disconnect()

@@ -16,6 +16,7 @@ from datetime import datetime, time as dt_time, timedelta
 import time
 import pytz
 import json
+import os
 
 from day_trading_agents import (
     DataAggregatorAgent, 
@@ -26,6 +27,9 @@ from day_trading_agents import (
     IntradayTraderAgent
 )
 from utils import setup_logging, is_market_open
+from tracing_setup import TradingBotTracer, TracedOperation
+from performance_tracker import PerformanceTracker
+from daily_analyzer import DailyPerformanceAnalyzer
 
 class DayTraderOrchestrator:
     def __init__(self, allocation, paper_trade=True):
@@ -35,7 +39,14 @@ class DayTraderOrchestrator:
         self.allocation = allocation
         self.paper_trade = paper_trade
         self.log_adapter = logging.LoggerAdapter(self.logger, {'agent': 'Orchestrator'})
+        
+        # Initialize tracing and performance tracking
+        self.tracer_instance = TradingBotTracer(service_name="day-trading-bot")
+        self.tracer = self.tracer_instance.get_tracer()
+        self.performance_tracker = PerformanceTracker()
+        
         self.log(logging.INFO, f"Day Trader Orchestrator initialized with {self.allocation*100}% capital allocation.")
+        self.log(logging.INFO, "[OK] Performance tracking and tracing enabled")
 
     def log(self, level, message, **kwargs):
         self.log_adapter.log(level, message, **kwargs)
@@ -45,28 +56,86 @@ class DayTraderOrchestrator:
         Phase 0: Collect fresh market data if needed.
         Skips if data file is already current for today.
         """
-        self.log(logging.INFO, "Starting Phase 0: Data Aggregation.")
-        aggregator_agent = DataAggregatorAgent(self)
-        aggregator_agent.run()
+        with TracedOperation(self.tracer_instance, "Phase0_DataAggregation") as span:
+            self.log(logging.INFO, "Starting Phase 0: Data Aggregation.")
+            span.set_attribute("phase", "0_data_aggregation")
+            span.set_attribute("allocation", self.allocation)
+            
+            aggregator_agent = DataAggregatorAgent(self)
+            aggregator_agent.run()
+            
+            span.add_event("Data aggregation completed")
         self.log(logging.INFO, "Data Aggregation complete.")
 
     def run_pre_market_analysis(self):
         """
         Phase 1: Run the LLM-based agent to generate the watchlist.
         """
-        self.log(logging.INFO, "Starting Phase 1: Pre-Market Analysis.")
-        watchlist_agent = WatchlistAnalystAgent(self)
-        watchlist_agent.run()
-        self.log(logging.INFO, "Pre-Market Analysis complete. Watchlist generated.")
+        with TracedOperation(self.tracer_instance, "Phase1_PreMarketAnalysis") as span:
+            self.log(logging.INFO, "Starting Phase 1: Pre-Market Analysis.")
+            span.set_attribute("phase", "1_pre_market_analysis")
+            
+            watchlist_agent = WatchlistAnalystAgent(self)
+            watchlist_agent.run()
+            
+            span.add_event("Pre-market analysis completed")
+            self.log(logging.INFO, "Pre-Market Analysis complete. Watchlist generated.")
+
+    def _run_atr_prediction(self):
+        """Helper method to run ATR prediction."""
+        try:
+            with open('full_market_data.json', 'r') as f:
+                market_data = json.load(f)
+            
+            atr_predictor = ATRPredictorAgent(self)
+            predicted_stocks = atr_predictor.run(market_data)
+            
+            # Save predictions for next phase
+            with open('atr_predictions.json', 'w') as f:
+                json.dump(predicted_stocks, f, indent=2)
+            
+            self.log(logging.INFO, f"ATR Prediction complete. {len(predicted_stocks)} stocks predicted to have ATR > 1.5%")
+            return predicted_stocks
+            
+        except Exception as e:
+            self.log(logging.ERROR, f"ATR Prediction failed: {e}. Proceeding with all stocks.")
+            return market_data
+    
+    def _run_ticker_validation(self):
+        """Helper method to run ticker validation."""
+        try:
+            # Load watchlist
+            with open('day_trading_watchlist.json', 'r') as f:
+                watchlist = json.load(f)
+            
+            validator = TickerValidatorAgent(self)
+            validated_tickers = validator.run(watchlist)
+            
+            # Save validated tickers
+            with open('validated_tickers.json', 'w') as f:
+                json.dump(validated_tickers, f, indent=2)
+            
+            self.log(logging.INFO, f"Validation complete. {len(validated_tickers)} tickers are tradeable.")
+            return validated_tickers
+            
+        except Exception as e:
+            self.log(logging.ERROR, f"Validation failed: {e}")
+            return []
 
     def run_intraday_trading(self):
         """
         Phase 2: Run the high-speed algorithmic trading agent.
         """
-        self.log(logging.INFO, "Starting Phase 2: Intraday Trading.")
-        trader_agent = IntradayTraderAgent(self, self.allocation, self.paper_trade)
-        trader_agent.run()
-        self.log(logging.INFO, "Intraday Trading complete. All positions liquidated.")
+        with TracedOperation(self.tracer_instance, "Phase2_IntradayTrading") as span:
+            self.log(logging.INFO, "Starting Phase 2: Intraday Trading.")
+            span.set_attribute("phase", "2_intraday_trading")
+            span.set_attribute("paper_trade", self.paper_trade)
+            
+            trader_agent = IntradayTraderAgent(self, self.allocation, self.paper_trade)
+            trader_agent.run()
+            
+            span.add_event("Intraday trading completed")
+            self.log(logging.INFO, "Intraday Trading complete. All positions liquidated.")
 
     def start(self):
         """
@@ -147,23 +216,20 @@ class DayTraderOrchestrator:
         self.log(logging.INFO, "PHASE 0.5: ATR Prediction (7:15 AM)")
         self.log(logging.INFO, "=" * 60)
         
-        # Load market data
-        try:
-            with open('full_market_data.json', 'r') as f:
-                market_data = json.load(f)
-            
-            atr_predictor = ATRPredictorAgent(self)
-            predicted_stocks = atr_predictor.run(market_data)
-            
-            # Save predictions for next phase
-            with open('atr_predictions.json', 'w') as f:
-                json.dump(predicted_stocks, f, indent=2)
-            
-            self.log(logging.INFO, f"ATR Prediction complete. {len(predicted_stocks)} stocks predicted to have ATR > 1.5%")
-            
-        except Exception as e:
-            self.log(logging.ERROR, f"ATR Prediction failed: {e}. Proceeding with all stocks.")
-            predicted_stocks = market_data
+        # Check if predictions already exist and are fresh for today
+        predictions_path = 'atr_predictions.json'
+        if os.path.exists(predictions_path):
+            pred_mtime = datetime.fromtimestamp(os.path.getmtime(predictions_path))
+            if pred_mtime.date() == datetime.now().date():
+                self.log(logging.INFO, f"ATR predictions already up-to-date for today. Skipping Phase 0.5.")
+                with open(predictions_path, 'r') as f:
+                    predicted_stocks = json.load(f)
+            else:
+                # Predictions are old, regenerate
+                predicted_stocks = self._run_atr_prediction()
+        else:
+            # No predictions file, run prediction
+            predicted_stocks = self._run_atr_prediction()
 
         # --- Phase 1: Pre-Market Analysis (7:30 AM) ---
         self.log(logging.INFO, "=" * 60)
@@ -176,23 +242,20 @@ class DayTraderOrchestrator:
         self.log(logging.INFO, "PHASE 1.5: Ticker Validation (8:15 AM)")
         self.log(logging.INFO, "=" * 60)
         
-        try:
-            # Load watchlist
-            with open('day_trading_watchlist.json', 'r') as f:
-                watchlist = json.load(f)
-            
-            validator = TickerValidatorAgent(self)
-            validated_tickers = validator.run(watchlist)
-            
-            # Save validated tickers
-            with open('validated_tickers.json', 'w') as f:
-                json.dump(validated_tickers, f, indent=2)
-            
-            self.log(logging.INFO, f"Validation complete. {len(validated_tickers)} tickers are tradeable.")
-            
-        except Exception as e:
-            self.log(logging.ERROR, f"Ticker Validation failed: {e}. Using original watchlist.")
-            validated_tickers = watchlist
+        # Check if validation already done today
+        validated_path = 'validated_tickers.json'
+        if os.path.exists(validated_path):
+            val_mtime = datetime.fromtimestamp(os.path.getmtime(validated_path))
+            if val_mtime.date() == datetime.now().date():
+                self.log(logging.INFO, f"Ticker validation already up-to-date for today. Skipping Phase 1.5.")
+                with open(validated_path, 'r') as f:
+                    validated_tickers = json.load(f)
+            else:
+                # Validation is old, re-run
+                validated_tickers = self._run_ticker_validation()
+        else:
+            # No validation file, run validation
+            validated_tickers = self._run_ticker_validation()
         
         # --- Phase 1.75: Pre-Market Momentum (9:00 AM) ---
         self.log(logging.INFO, "=" * 60)
@@ -235,6 +298,11 @@ class DayTraderOrchestrator:
         # Once the loop exits, the market is open.
         self.log(logging.INFO, "Market is open. Proceeding with intraday trading.")
         self.run_intraday_trading()
+        
+        # Analyze daily performance
+        self.log(logging.INFO, "Analyzing today's performance...")
+        analyzer = DailyPerformanceAnalyzer(self.log_file, self.performance_tracker)
+        analyzer.analyze_day()
         
         self.log(logging.INFO, "Day trading bot workflow finished.")
 

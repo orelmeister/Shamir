@@ -70,7 +70,7 @@ os.remove('day_trading_watchlist.json')
 **Purpose**: Collect fresh market data
 
 **Screening Criteria:**
-- Market Cap: $50M - $350M (small-cap sweet spot)
+- Market Cap: $50M - $2B (small to mid-cap sweet spot for volatility + liquidity)
 - Price: > $1 (avoid penny stocks)
 - Volume: > 50K daily average
 - Exchanges: NYSE, NASDAQ only
@@ -122,7 +122,7 @@ os.remove('day_trading_watchlist.json')
 
 3. **Fundamental Risk Assessment**
    - Revenue: Does company have real business?
-   - Market Cap: Is it tradeable? ($50M-$350M)
+   - Market Cap: Is it tradeable? ($50M-$2B)
    - Business Clarity: Biotech? Tech? Clear model?
 
 4. **Day Trading Viability**
