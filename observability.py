@@ -25,6 +25,42 @@ class TradingDatabase:
     def __init__(self, db_path: str = "trading_history.db"):
         self.db_path = db_path
         self._init_database()
+        self._optimize_database()
+    
+    def _optimize_database(self):
+        """Optimize database performance with WAL mode and indexes"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Enable WAL mode for better concurrent read/write performance
+            cursor.execute("PRAGMA journal_mode=WAL")
+            
+            # Increase cache size to 10MB (default is 2MB)
+            cursor.execute("PRAGMA cache_size=-10000")  # Negative means KB
+            
+            # Synchronous mode to NORMAL for better performance (still safe)
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            
+            # Create indexes for faster queries
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol_timestamp 
+                ON trades(symbol, timestamp)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_timestamp 
+                ON trades(timestamp)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_daily_metrics_date 
+                ON daily_metrics(date)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agent_health_timestamp 
+                ON agent_health(timestamp)
+            """)
+            
+            conn.commit()
+            logger.info("Database optimized with WAL mode and indexes")
     
     def _init_database(self):
         """Initialize database schema"""

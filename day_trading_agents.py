@@ -9,6 +9,7 @@ import os
 import time
 import asyncio
 import aiohttp
+import multiprocessing
 from datetime import datetime
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1011,9 +1012,10 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.health_monitor = SelfHealingMonitor(self.agent_name)
         self.improvement_engine = ContinuousImprovementEngine(self.agent_name)
         
-        # Health check interval (check every 5 minutes)
+        # Performance optimization settings
+        self.max_workers = max(4, multiprocessing.cpu_count() - 2)  # Leave 2 cores for OS
         self.last_health_check = time.time()
-        self.health_check_interval = 300  # seconds
+        self.health_check_interval = 60  # seconds (1 min for tighter monitoring)
         
         self.log(logging.INFO, f"Intraday Trader Agent initialized with {self.allocation*100}% capital allocation. Paper trading: {self.paper_trade}")
         self.log(logging.INFO, "Autonomous systems enabled: Observability, Self-Evaluation, Continuous Improvement")

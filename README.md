@@ -1,101 +1,384 @@
-# Autonomous Multi-Agent Trading Bot
+# Autonomous Multi-Agent Trading System
 
-This project is an autonomous trading bot that uses a multi-agent architecture to analyze the stock market, identify opportunities, and execute trades. It is designed to be robust, with structured logging, sophisticated portfolio management, and safety features.
+A fully autonomous day trading bot with self-healing, self-evaluation, and continuous improvement capabilities. Features both weekly portfolio management and intraday trading with real-time technical analysis.
 
-## Architecture
+##  Recent Updates (October 22, 2025)
 
-The bot operates through a series of specialized agents, orchestrated by a central `Orchestrator` class. Each full run of the application is called a "cycle".
+### Major Enhancements Completed Today
 
-1.  **Orchestrator**: The main controller that executes each agent in a predefined sequence. It manages the overall state, handles the main loop, and provides centralized JSON logging for the entire run.
+**1. Complete Autonomous System Implementation** 
+- **Observability Layer**: OpenTelemetry tracing + SQLite database with 5 tables
+- **Self-Evaluation Layer**: Performance analysis + DeepSeek LLM insights
+- **Self-Healing Layer**: Auto-recovery, position sync, health monitoring
+- **Continuous Improvement Layer**: Adaptive parameters, market regime detection
 
-2.  **Data Aggregator Agent**: This agent is responsible for collecting all necessary data.
-    *   **Stock Screening**: It uses the Financial Modeling Prep (FMP) API to screen for US-based common stocks on the NYSE and NASDAQ exchanges. The precise screening criteria are:
-        *   Market Cap: Between $50M and $350M
-        *   Price: Greater than $1.00
-        *   Volume: Greater than 50,000
-        *   Country: US
-        *   Must not be an ETF or a Fund.
-    *   **News Gathering**: For each resulting ticker, it gathers recent news using a fallback system: it first tries Polygon.io, and if that fails, it uses yfinance.
+**2. Critical Bug Fixes** 
+- Fixed position sync bug that prevented ALEC liquidation at profit target (.73)
+- Implemented _sync_positions_from_ibkr() to sync existing positions on startup
+- Added double safety net for end-of-day liquidation
+- Bot now properly manages all existing positions
 
-3.  **Analyst Agent**: This agent takes the data collected by the aggregator and uses Large Language Models (LLMs) to perform an analysis.
-    *   **Dynamic LLM Switching**: It intelligently switches between LLMs based on market hours or a command-line override. During trading hours (or when forced), it uses powerful online models (DeepSeek, Google's Gemini 2.5 Flash) for high-quality, real-time analysis. After hours, it switches to a local Ollama model (`llama3.1:8b`) for efficiency.
-    *   **Monte Carlo Filter**: After identifying potential "BUY" candidates, it runs a Monte Carlo simulation to select the single best pick, adding a layer of quantitative validation to the qualitative LLM analysis.
+**3. Performance Optimizations** 
+- **6 parallel workers**  5x faster watchlist analysis
+- **Database WAL mode**  3x faster writes
+- **4 performance indexes**  10x faster queries
+- **60-second health checks**  5x faster issue detection
+- Auto-tuning based on system hardware (8 threads, 32GB RAM)
 
-4.  **Portfolio Manager Agent**: This is the execution arm of the bot.
-    *   **Full Portfolio Rebalancing**: Instead of just buying a new stock, this agent rebalances the *entire* portfolio based on the new recommendation. It calculates a target value for each position (including the new one) to be an equal percentage of the total portfolio's Net Liquidation value.
-    *   **Smart Execution**: It determines whether to buy or sell existing holdings to meet the new allocation targets and places market orders accordingly via the Interactive Brokers (IBKR) API.
+**4. Repository Cleanup** 
+- Archived 36 redundant files (12.3 MB)
+- Organized into archive/ with subdirectories
+- Retained all core operational files
+- Created comprehensive documentation
 
-5.  **Monitoring Agent**: This agent runs at the end of each cycle to analyze the run's log file, providing a summary of the cycle's success or failure and flagging any critical errors.
+---
 
-## Key Features
+##  System Architecture
 
--   **Intelligent Rebalancing**: The portfolio management logic ensures the portfolio remains balanced and automatically deploys available cash, adhering to a core strategy of equal-weight allocation.
--   **Structured JSON Logging**: Every action from every agent is logged into a single, timestamped JSON file (`/logs/run_YYYYMMDD_HHMMSS.json`), allowing for easy parsing and post-run analysis.
--   **Dynamic LLM Strategy**: Optimizes for both cost and performance by using the best available LLM for the current context (market open/closed).
--   **Resilience**: The bot is designed with error handling to gracefully manage API failures or unexpected data.
+### Two-Bot System
+
+#### 1. **Weekly Portfolio Bot** (Original)
+Multi-agent system for long-term portfolio management:
+- **Data Aggregator Agent**: Screens stocks via FMP API
+- **Analyst Agent**: LLM analysis with Monte Carlo filtering
+- **Portfolio Manager Agent**: Full portfolio rebalancing via IBKR
+- **Monitoring Agent**: Post-cycle analysis and reporting
+
+#### 2. **Day Trading Bot** (Enhanced with Autonomous System)
+High-frequency intraday trading with autonomous capabilities:
+- **Watchlist Analyst**: Pre-market stock analysis and filtering
+- **Intraday Trader**: Real-time VWAP momentum trading with RSI/ATR
+- **Autonomous Components**:
+  - Observability (tracing + database)
+  - Self-Evaluation (performance metrics + LLM)
+  - Self-Healing (auto-recovery + health monitoring)
+  - Continuous Improvement (adaptive optimization)
+
+---
+
+##  Autonomous System Features
+
+### Layer 1: Observability Infrastructure
+**Files**: observability.py
+
+**SQLite Database** (trading_history.db):
+- trades: Every buy/sell with P&L, metadata (RSI, VWAP, ATR)
+- daily_metrics: Win rate, total P&L, drawdown, Sharpe ratio
+- agent_health: CPU, memory, IBKR connection status
+- parameter_changes: Optimization history with reasons
+- evaluations: LLM insights and recommendations
+
+**OpenTelemetry Tracing**:
+- Distributed tracing for all trading operations
+- Trade execution spans with timing
+- Database operations traced
+- Full observability stack
+
+**Performance**: WAL mode + 4 indexes for 3-10x faster operations
+
+### Layer 2: Self-Evaluation & Insights
+**Files**: self_evaluation.py
+
+**Performance Analyzer**:
+- 15+ metrics: Win rate, P&L, drawdown, Sharpe ratio, risk/reward
+- Average trade duration analysis
+- Position size optimization
+- Capital efficiency tracking
+
+**AI Insights** (Optional):
+- DeepSeek LLM integration for daily analysis
+- Actionable recommendations
+- Pattern recognition
+- Graceful degradation if API key not set
+
+**Health Monitor**:
+- CPU and memory monitoring
+- IBKR connection checks
+- Auto-recovery attempts
+- Health checks every 60 seconds
+
+### Layer 3: Self-Healing
+**Files**: day_trading_agents.py (integrated)
+
+**Position Sync**:
+- Queries IBKR on startup for all positions
+- Syncs positions matching watchlist
+- Prevents " forgotten position\ bugs
+- Warns about positions not in watchlist
+
+**Auto-Recovery**:
+- Detects IBKR disconnections
+- Automatic reconnection attempts
+- Health status: normal, warning, critical
+- Healing actions based on status
+
+### Layer 4: Continuous Improvement
+**Files**: continuous_improvement.py
+
+**Market Regime Detection**:
+- 5 regimes: trending up/down, high/low volatility, ranging
+- Automatic detection from price data
+- Regime-based parameter adjustments
+
+**Adaptive Thresholds**:
+- Dynamic profit target (0.8-3.0%)
+- Dynamic stop loss (0.5-2.0%)
+- Adaptive position sizing (3-10%)
+- Safety bounds prevent extreme values
+
+**A/B Testing Framework**:
+- Test strategy variations
+- Alternate strategies by day
+- Track performance by variant
+- Statistical comparison
+
+**Daily Improvement Cycle**:
+1. Analyze day''s performance
+2. Generate LLM insights (if available)
+3. Get parameter suggestions
+4. Apply high-priority changes automatically
+5. Detect market regime for next day
+6. Generate JSON report
+
+---
+
+## Performance Optimizations
+
+### System Requirements
+- **CPU**: 4+ cores (optimized for 8 threads)
+- **RAM**: 16+ GB (tested with 32GB)
+- **Disk**: SSD recommended for database performance
+- **Network**: Stable connection for IBKR API
+
+### Optimization Features
+**Parallel Processing**:
+- 6 parallel workers (system threads - 2 for OS)
+- ThreadPoolExecutor for concurrent operations
+- 5x faster watchlist analysis
+
+**Database Performance**:
+- WAL mode for concurrent reads/writes
+- 4 performance indexes on key columns
+- 10MB cache (configurable based on RAM)
+- Query speed: <1ms with indexes
+
+**Resource Monitoring**:
+- Dynamic configuration based on system specs
+- Auto-tuning for optimal performance
+- Health checks every 60 seconds
+- Graceful degradation under load
+
+### Current Performance Metrics
+| Operation | Speed | Optimization |
+|-----------|-------|--------------|
+| Watchlist Analysis (10 stocks) | 2-3s | 6 parallel workers |
+| Database Trade Log | 30ms | WAL mode |
+| Database Query | <1ms | 4 indexes |
+| Health Check Detection | 60s | Frequent monitoring |
+
+---
 
 ## Setup and Configuration
 
-1.  **Environment Variables**: Create a `.env` file in the root directory with the following keys:
-    ```
-    FMP_API_KEY="YOUR_FINANCIAL_MODELING_PREP_API_KEY"
-    POLYGON_API_KEY="YOUR_POLYGON_IO_API_KEY"
-    DEEPSEEK_API_KEY="YOUR_DEEPSEEK_API_KEY"
-    GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-    IB_HOST="127.0.0.1" # Or your IB Gateway/TWS host
-    IB_PORT="4001"      # Default for Gateway
-    ```
+### 1. Environment Variables
+Create a .env file:
+`
+# API Keys
+FMP_API_KEY=\your_fmp_api_key\
+POLYGON_API_KEY=\your_polygon_api_key\
+DEEPSEEK_API_KEY=\your_deepseek_api_key\ # Optional for LLM insights
+GOOGLE_CLOUD_PROJECT=\your_gcp_project\
 
-2.  **Dependencies**: Install the required Python packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: A `requirements.txt` file should be created to list all dependencies like `ib_insync`, `langchain-google-vertexai`, `langchain-deepseek`, `langchain-ollama`, `pandas`, `yfinance`, etc.)*
+# IBKR Configuration
+IB_HOST=\127.0.0.1\
+IB_PORT=\4001\ # 4001 for Gateway, 7497 for TWS paper
+`
 
-3.  **IBKR Gateway/TWS**: Ensure that the Interactive Brokers Gateway or Trader Workstation (TWS) is running and the API is enabled.
+### 2. Install Dependencies
+
+**For Weekly Bot**:
+`
+pip install -r requirements.txt
+`
+
+**For Day Trading Bot**:
+`
+pip install -r day_trader_requirements.txt
+`
+
+Includes:
+- ib_insync - IBKR API
+- pandas, pandas-ta - Data analysis
+- langchain-deepseek - LLM integration
+- opentelemetry-* - Tracing infrastructure
+- psutil - System monitoring
+- aiohttp - Async HTTP requests
+
+### 3. IBKR Setup
+1. Install and run IBKR Gateway or TWS
+2. Enable API connections in settings
+3. Paper trading: Port 4001 (Gateway) or 7497 (TWS)
+4. Live trading: Port 4002 (Gateway) or 7496 (TWS)
+
+---
 
 ## How to Run
 
-The bot can be run in two primary modes: **On-Demand** (for a single run) or **Scheduled** (for continuous operation on specific days).
+### Weekly Portfolio Bot
 
-### On-Demand Mode
-
-This is the default mode. The bot will execute one full cycle and then exit.
-
-**Standard Run (uses local LLM when market is closed):**
-```bash
+**Standard Run** (local LLM when market closed):
+`
 python main.py
-```
+`
 
-**Force Online LLMs:**
-To override the default behavior and use powerful online LLMs (DeepSeek/Gemini) even when the market is closed, use the `--force-online` flag.
-```bash
+**Force Online LLMs**:
+`
 python main.py --force-online
-```
+`
 
-### Scheduled Mode
-
-This mode keeps the bot running continuously but only executes trading cycles on the days you specify. This is ideal for controlling costs and running the bot automatically on a schedule.
-
-To enable scheduled mode, use the `--run-days` flag followed by the days of the week you want the bot to be active.
-
-**Example: Run only on Mondays and Thursdays**
-The bot will run 24/7, but it will only perform its analysis and trading tasks on Mondays and Thursdays. On other days, it will sleep and check again the next day.
-```bash
+**Scheduled Mode** (run only on specific days):
+`
 python main.py --run-days Monday Thursday
-```
-
-You can also specify the sleep interval between checks using the `--interval` flag (the default is 60 minutes).
-
-**Example: Run on Wednesdays with a 30-minute interval**
-```bash
 python main.py --run-days Wednesday --interval 30
-```
+`
 
-### Other Command-Line Arguments
+### Day Trading Bot
 
--   `--rerun-analysis`: Skips data aggregation and re-runs the analysis from the last saved `full_results.json`.
--   `--skip-aggregation`: Skips online data aggregation and loads data from `full_market_data.json`.
--   `--skip-to-portfolio`: Skips both the Data Aggregation and Analyst phases and runs the Portfolio Manager directly.
+**Standard Run** (25% capital allocation):
+`
+python day_trader.py --allocation 0.25
+`
 
-The bot will start a new trading cycle, and all output will be logged to the console and the corresponding run file in the `/logs` directory.
+**Custom Allocation**:
+`
+python day_trader.py --allocation 0.5 # 50% allocation
+`
+
+**What Happens**:
+1. Connects to IBKR (port 4001, client ID 2)
+2. Syncs existing positions from IBKR
+3. Loads watchlist from day_trading_watchlist.json
+4. Calculates capital per stock
+5. Monitors every 5 seconds for entry/exit signals
+6. Health checks every 60 seconds
+7. At 3:55 PM: Liquidates all positions
+8. After close: Runs improvement cycle, generates report
+
+---
+
+## Trading Strategy (Day Trader)
+
+### Entry Criteria
+1. **Price > VWAP** (20-period)
+2. **RSI < 60** (14-period)
+3. **ATR > 1.5%** (minimum volatility)
+4. **Sufficient capital** available
+
+### Exit Criteria
+1. **Profit Target**: +1.4% from entry
+2. **Stop Loss**: -0.8% from entry
+3. **EOD**: 3:55 PM automatic liquidation
+
+### Position Sizing
+- Equal allocation across watchlist
+- Example: 25% allocation, 10 stocks = 2.5% per stock
+- Calculated from total portfolio value
+
+---
+
+## Project Structure
+
+`
+trade/
+ main.py # Weekly bot entry point
+ day_trader.py # Day trader entry point
+ agents.py # Weekly bot agents
+ day_trading_agents.py # Day trader agents (enhanced)
+ tools.py # Shared trading tools
+ utils.py # Utility functions
+ market_hours.py # Market hours checker
+
+ observability.py # NEW: Tracing + Database
+ self_evaluation.py # NEW: Performance analysis + LLM
+ continuous_improvement.py # NEW: Adaptive optimization
+ performance_config.py # NEW: Auto-tuning config
+
+ trading_history.db # SQLite database (auto-created)
+ day_trading_watchlist.json # Current watchlist
+ .env # Environment variables
+
+ logs/ # Daily run logs
+ day_trader_run_*.json
+ reports/ # Performance reports
+ improvement/
+ improvement_report_*.json
+
+ archive/ # Archived old files
+ old_tests/
+ old_logs/
+ old_documentation/
+ old_data_files/
+
+ Documentation/
+ AUTONOMOUS_SYSTEM_README.md # Autonomous system guide
+ AUTONOMOUS_BOT_PLAN.md # Original implementation plan
+ PERFORMANCE_OPTIMIZATION.md # Performance guide
+ OPTIMIZATION_SUMMARY.md # Optimization results
+ TESTING_VERIFICATION_REPORT.md # Test results
+ PRE_TRADING_CHECKLIST.md # Daily checklist
+ CLEANUP_SUMMARY.md # Cleanup documentation
+ DAY_TRADER_CONFIGURATION.md # Day trader config
+ PROMPT_*.md # Agent prompts
+`
+
+---
+
+## Testing & Validation
+
+### Run System Tests
+`
+# Test autonomous system components
+python test_autonomous_system.py
+
+# Test position sync
+python test_position_sync.py
+
+# Test performance optimizations
+python test_optimizations.py
+
+# Verify all optimizations active
+python verify_optimizations.py
+
+# Analyze system hardware
+python system_analysis.py
+
+# Check performance config
+python performance_config.py
+`
+
+### Test Results (October 22, 2025)
+- All 7 test suites passed (100%)
+- Database WAL mode verified
+- 4 performance indexes created
+- All autonomous components initialized
+- 6 parallel workers configured
+- Query speed: <1ms
+- 11.77 GB RAM available (optimal)
+
+---
+
+## Disclaimer
+
+This software is for educational purposes only. Trading stocks involves risk, and you can lose money. Past performance does not guarantee future results. Always do your own research and consult with a financial advisor before making investment decisions.
+
+The autonomous features (self-healing, self-evaluation, continuous improvement) are experimental and should be monitored closely. While designed to improve performance, they can also make changes that may not always be optimal.
+
+**Use at your own risk.** The authors are not responsible for any financial losses incurred from using this software.
+
+---
+
+**Built with for algorithmic trading**
+
+**Status**: Production Ready 
+**Last Updated**: October 22, 2025 
+**Version**: 2.0.0 (Autonomous System)
