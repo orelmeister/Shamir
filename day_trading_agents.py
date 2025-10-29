@@ -20,7 +20,7 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_google_genai import ChatGoogleGenerativeAI
 import pandas as pd
 import yfinance as yf
-from ib_insync import IB, Stock, MarketOrder, LimitOrder, Order, util
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, Order, util
 import pandas_ta as ta
 from market_hours import is_market_open
 from polygon import RESTClient
@@ -1935,29 +1935,45 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                             
                                             self.log(logging.INFO, f"BUY FILLED: {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
                                             
-                                            # Step 2: NOW place take profit and stop loss orders AFTER BUY confirmed
+                                            # Step 2: NOW place OCO bracket orders AFTER BUY confirmed
                                             # Recalculate based on ACTUAL fill price
                                             actual_take_profit = fill_price * 1.026  # +2.6% from actual fill
                                             actual_stop_loss = fill_price * 0.991    # -0.9% from actual fill
                                             
-                                            # Place Take Profit limit order (IBKR allows this for closing long position)
+                                            # Create unique OCA (One-Cancels-All) group for this position
+                                            oca_group = f"OCA_{contract.symbol}_{int(time.time())}"
+                                            
+                                            # Take Profit order (LIMIT SELL)
                                             take_profit_order = LimitOrder('SELL', filled_quantity, actual_take_profit)
+                                            take_profit_order.ocaGroup = oca_group
+                                            take_profit_order.ocaType = 1  # Cancel all when one fills
+                                            take_profit_order.tif = 'DAY'
+                                            take_profit_order.outsideRth = False
+                                            
+                                            # Stop Loss order (STOP SELL) - Now part of OCO bracket!
+                                            stop_loss_order = StopOrder('SELL', filled_quantity, actual_stop_loss)
+                                            stop_loss_order.ocaGroup = oca_group  # SAME group as take profit
+                                            stop_loss_order.ocaType = 1  # Cancel all when one fills
+                                            stop_loss_order.tif = 'DAY'
+                                            stop_loss_order.outsideRth = False
+                                            
+                                            # Place both OCO orders
                                             tp_trade = self.ib.placeOrder(trade_contract, take_profit_order)
+                                            sl_trade = self.ib.placeOrder(trade_contract, stop_loss_order)
                                             
-                                            # NOTE: No Stop Loss order - IBKR rejects Stop SELL orders as short-sells
-                                            # Bot will monitor price and place MarketOrder when stop loss hit
+                                            self.log(logging.INFO, f"OCO Bracket placed: TP @ ${actual_take_profit:.2f} (+2.6%), SL @ ${actual_stop_loss:.2f} (-0.9%), OCA Group: {oca_group}")
                                             
-                                            self.log(logging.INFO, f"Take Profit order placed @ ${actual_take_profit:.2f} (TP), Stop Loss @ ${actual_stop_loss:.2f} (bot-monitored)")
-                                            
-                                            # Store position with bracket order references
+                                            # Store position with OCO bracket references
                                             self.positions[contract.symbol] = {
                                                 "quantity": filled_quantity,
                                                 "entry_price": fill_price,
                                                 "contract": contract,
                                                 "atr_pct": atr_pct,
                                                 "take_profit_trade": tp_trade,  # Reference to TP order
-                                                "stop_loss_price": actual_stop_loss,  # Bot monitors this
-                                                "take_profit_price": actual_take_profit
+                                                "stop_loss_trade": sl_trade,    # Reference to SL order (OCO)
+                                                "stop_loss_price": actual_stop_loss,
+                                                "take_profit_price": actual_take_profit,
+                                                "oca_group": oca_group  # Track OCO group
                                             }
                                             
                                             # DATABASE COORDINATION: Register position in shared database

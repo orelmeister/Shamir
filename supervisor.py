@@ -28,7 +28,7 @@ class BotSupervisor:
         self.sleeping = False
         
         # Schedule times (Pacific Time)
-        self.WAKE_HOUR = 7   # 7:00 AM PT = 10:00 AM ET
+        self.WAKE_HOUR = 5   # 5:00 AM PT = 8:00 AM ET (1.5 hours before market for full analysis)
         self.SLEEP_HOUR = 13  # 1:00 PM PT = 4:00 PM ET (market close)
         
     def start_exit_manager(self):
