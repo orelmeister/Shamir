@@ -14,7 +14,11 @@ LOG_FILE = os.path.join(LOG_DIR, "ticker_screener_fmp.log")
 
 # Market Cap Range
 MIN_MARKET_CAP = 300_000_000  # $300 Million
-MAX_MARKET_CAP = 10_000_000_000 # $10 Billion
+MAX_MARKET_CAP = 20_000_000_000 # $20 Billion
+
+# Price Range (for day trading)
+MIN_PRICE = 1.0  # $1
+MAX_PRICE = 18.0 # $18
 
 # --- Logging Setup ---
 if not os.path.exists(LOG_DIR):
@@ -40,28 +44,84 @@ def screen_tickers_fmp():
         print("Error: FMP_API_KEY not found.")
         return
 
-    logging.info(f"Screening for tickers with market cap between ${MIN_MARKET_CAP/1_000_000:.0f}M and ${MAX_MARKET_CAP/1_000_000_000:.0f}B.")
+    logging.info(f"Screening for tickers with market cap between ${MIN_MARKET_CAP/1_000_000:.0f}M and ${MAX_MARKET_CAP/1_000_000_000:.0f}B and price between ${MIN_PRICE} and ${MAX_PRICE}.")
 
     try:
-        # Construct the API URL for the FMP stock screener
-        url = "https://financialmodelingprep.com/api/v3/stock-screener"
-        params = {
-            "marketCapMoreThan": MIN_MARKET_CAP,
-            "marketCapLowerThan": MAX_MARKET_CAP,
-            "isActivelyTrading": "true",
-            "exchange": "NASDAQ", # Focusing on NASDAQ for quality
-            "limit": 1000, # Set a reasonable limit
-            "apikey": FMP_API_KEY
-        }
-
-        response = requests.get(url, params=params)
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        # Query both NYSE and NASDAQ exchanges
+        all_tickers = []
+        exchanges = ["NASDAQ", "NYSE"]
         
-        data = response.json()
+        for exchange in exchanges:
+            logging.info(f"Querying {exchange}...")
+            url = "https://financialmodelingprep.com/api/v3/stock-screener"
+            params = {
+                "marketCapMoreThan": MIN_MARKET_CAP,
+                "marketCapLowerThan": MAX_MARKET_CAP,
+                "priceMoreThan": MIN_PRICE,
+                "priceLowerThan": MAX_PRICE,
+                "isActivelyTrading": "true",
+                "exchange": exchange,
+                "limit": 1000,
+                "apikey": FMP_API_KEY
+            }
 
-        if not data:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data:
+                logging.info(f"Found {len(data)} tickers on {exchange}")
+                all_tickers.extend(data)
+            else:
+                logging.warning(f"No tickers found on {exchange}")
+
+        if not all_tickers:
             logging.warning("No tickers found from FMP matching the criteria. The output file will be empty.")
             return
+        
+        # Remove duplicates by ticker symbol
+        seen_tickers = set()
+        unique_tickers = []
+        for ticker_data in all_tickers:
+            ticker = ticker_data.get('symbol')
+            if ticker and ticker not in seen_tickers:
+                seen_tickers.add(ticker)
+                unique_tickers.append(ticker_data)
+        
+        data = unique_tickers
+        logging.info(f"Total unique tickers across all exchanges: {len(data)}")
+
+        # Blacklist: Known problematic tickers (ADRs, foreign stocks with restrictions)
+        BLACKLIST = {'BBAR', 'YPF', 'VALE', 'PAM', 'TX', 'BBD', 'ITUB', 'PBR', 'SID'}
+        
+        # Filter out ADRs (American Depositary Receipts) - often have trading restrictions
+        # ADR tickers often end in certain patterns or have 'ADR' in company name
+        filtered_data = []
+        adr_keywords = ['ADR', 'ADS', 'DEPOSITARY', 'SA DE CV', 'NV', 'PLC', 'LTD', 'BANCO']
+        
+        for item in data:
+            ticker = item.get('symbol', '')
+            company_name = item.get('companyName', '').upper()
+            
+            # Skip blacklisted tickers
+            if ticker in BLACKLIST:
+                logging.debug(f"Filtering out blacklisted ticker: {ticker}")
+                continue
+            
+            # Skip if company name contains ADR indicators
+            is_adr = any(keyword in company_name for keyword in adr_keywords)
+            
+            # Skip common foreign ADR suffixes
+            if ticker.endswith('.A') or ticker.endswith('.B') or ticker.endswith('.C'):
+                is_adr = True
+            
+            if not is_adr:
+                filtered_data.append(item)
+            else:
+                logging.debug(f"Filtering out potential ADR: {ticker} ({company_name})")
+        
+        data = filtered_data
+        logging.info(f"After ADR/blacklist filtering: {len(data)} tickers remaining")
 
         # FMP returns a list of objects, we just need the 'symbol'
         screened_tickers = [{"ticker": item['symbol']} for item in data]

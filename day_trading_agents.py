@@ -9,8 +9,9 @@ import os
 import time
 import asyncio
 import aiohttp
+import math
 import multiprocessing
-from datetime import datetime
+from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -19,9 +20,10 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_google_genai import ChatGoogleGenerativeAI
 import pandas as pd
 import yfinance as yf
-from ib_insync import IB, Stock, MarketOrder, util
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, Order, util
 import pandas_ta as ta
 from market_hours import is_market_open
+from polygon import RESTClient
 
 # Autonomous system imports
 from observability import get_database, get_tracer
@@ -68,23 +70,28 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         self.log(logging.INFO, "Data Aggregator Agent initialized.")
     
     def run(self):
-        """Check if data is fresh for today, if not, aggregate new data."""
+        """Check if data is fresh for today AND complete, if not, aggregate new data."""
         self.log(logging.INFO, "--- [PHASE 0] Checking market data freshness. ---")
         
-        # Check if data file exists and is from today
+        # Check if data file exists and is from today AND has sufficient data
         if os.path.exists(AGGREGATED_DATA_FILE):
             try:
                 # Check file modification time
                 file_mod_time = datetime.fromtimestamp(os.path.getmtime(AGGREGATED_DATA_FILE))
                 today = datetime.now().date()
                 
-                if file_mod_time.date() == today:
-                    self.log(logging.INFO, f"{AGGREGATED_DATA_FILE} is already up-to-date for today ({today}). Skipping aggregation.")
+                # Load and check data quality
+                with open(AGGREGATED_DATA_FILE, 'r') as f:
+                    existing_data = json.load(f)
+                
+                # Data is valid if: from today AND has at least 20 stocks with news
+                if file_mod_time.date() == today and len(existing_data) >= 20:
+                    self.log(logging.INFO, f"{AGGREGATED_DATA_FILE} is fresh ({today}) with {len(existing_data)} stocks. Using cached data.")
                     return
                 else:
-                    self.log(logging.INFO, f"{AGGREGATED_DATA_FILE} is from {file_mod_time.date()}. Refreshing data for today ({today}).")
+                    self.log(logging.INFO, f"{AGGREGATED_DATA_FILE} is stale or insufficient ({len(existing_data)} stocks). Refreshing data.")
             except Exception as e:
-                self.log(logging.WARNING, f"Could not check file modification time: {e}. Will refresh data.")
+                self.log(logging.WARNING, f"Could not validate existing data: {e}. Will refresh data.")
         else:
             self.log(logging.INFO, f"{AGGREGATED_DATA_FILE} not found. Collecting fresh market data.")
         
@@ -138,7 +145,19 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         return all_market_data
 
     async def _fetch_target_tickers(self, session):
-        self.log(logging.INFO, "Fetching target tickers from FMP stock screener for NYSE and NASDAQ.")
+        # FIRST: Check if us_tickers.json exists (from ticker_screener_fmp.py)
+        us_tickers_file = "us_tickers.json"
+        if os.path.exists(us_tickers_file):
+            self.log(logging.INFO, f"Loading pre-screened tickers from {us_tickers_file}...")
+            with open(us_tickers_file, 'r') as f:
+                ticker_data = json.load(f)
+                # Extract ticker symbols from the list of dicts
+                tickers = [item['ticker'] for item in ticker_data]
+                self.log(logging.INFO, f"Loaded {len(tickers)} pre-screened tickers from {us_tickers_file}.")
+                return tickers
+        
+        # FALLBACK: If us_tickers.json doesn't exist, fetch from FMP API
+        self.log(logging.INFO, "us_tickers.json not found. Fetching target tickers from FMP stock screener for NYSE and NASDAQ.")
         all_tickers = set()
         exchanges_to_query = ["nyse", "nasdaq"]
 
@@ -246,7 +265,7 @@ class DataAggregatorAgent(BaseDayTraderAgent):
                 if result:
                     ticker, atr_pct = result
                     filtered.append(ticker)
-                    self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% ✅")
+                    self.log(logging.DEBUG, f"{ticker}: ATR {atr_pct:.2f}% OK")
                 
                 completed += 1
                 # Log progress every 100 tickers
@@ -758,8 +777,14 @@ class TickerValidatorAgent(BaseDayTraderAgent):
         # Connect to IBKR
         try:
             self.ib = IB()
-            # Python 3.12 fix: Use util.run() to handle event loop properly
+            # Python 3.12 fix: Ensure event loop exists
+            import asyncio
             import ib_insync.util as ib_util
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            
             ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=2))
             self.log(logging.INFO, "Connected to IBKR successfully.")
         except Exception as e:
@@ -773,7 +798,7 @@ class TickerValidatorAgent(BaseDayTraderAgent):
             
             # Check memory: Has this ticker failed recently?
             if self._has_failed_recently(ticker):
-                self.log(logging.WARNING, f"❌ {ticker}: Previously failed validation (skipping)")
+                self.log(logging.WARNING, f"SKIP {ticker}: Previously failed validation")
                 continue
             
             # Validate with IBKR
@@ -787,10 +812,10 @@ class TickerValidatorAgent(BaseDayTraderAgent):
                     'original_data': item
                 })
                 self.log(logging.INFO, 
-                        f"✅ {ticker}: Valid (spread={validation['spread']:.2f}%, "
+                        f"VALID {ticker}: (spread={validation['spread']:.2f}%, "
                         f"vol={validation['volume']:,})")
             else:
-                self.log(logging.WARNING, f"❌ {ticker}: {validation['reason']}")
+                self.log(logging.WARNING, f"INVALID {ticker}: {validation['reason']}")
                 # Store failure in memory
                 self._record_failure(ticker, validation['reason'])
         
@@ -801,45 +826,51 @@ class TickerValidatorAgent(BaseDayTraderAgent):
         return validated
     
     def _validate_ticker(self, ticker: str) -> dict:
-        """Validate a single ticker with IBKR."""
+        """Validate a single ticker with IBKR using historical data (more reliable than reqMktData)."""
         try:
             # Create contract
             contract = Stock(ticker, 'SMART', 'USD')
             
-            # Request contract details
-            details = self.ib.reqContractDetails(contract)
-            if not details:
-                return {"valid": False, "reason": "No contract details found"}
+            # Qualify contract first
+            qualified_contracts = self.ib.qualifyContracts(contract)
+            if not qualified_contracts:
+                return {"valid": False, "reason": "Contract not found"}
             
-            # Contract will be automatically qualified by reqContractDetails
+            contract = qualified_contracts[0]
             
-            # Get market data
-            ticker_data = self.ib.reqMktData(contract, '', False, False)
-            time.sleep(2)  # Wait for data to populate
+            # Use historical data instead of live market data (more reliable for validation)
+            # Request last 2 days of 1-minute bars to check if data is available
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime='',
+                durationStr='2 D',
+                barSizeSetting='1 min',
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
             
-            # Check bid/ask
-            if not ticker_data.bid or not ticker_data.ask or ticker_data.bid <= 0:
-                return {"valid": False, "reason": "No bid/ask data"}
+            if not bars or len(bars) < 10:
+                return {"valid": False, "reason": "Insufficient historical data"}
             
-            # Calculate spread
-            spread_pct = (ticker_data.ask - ticker_data.bid) / ticker_data.bid * 100
+            # Get recent bar for price check
+            recent_bar = bars[-1]
+            if not recent_bar.close or recent_bar.close <= 0:
+                return {"valid": False, "reason": "Invalid price data"}
             
-            if spread_pct > 2.0:
-                return {"valid": False, "reason": f"Spread {spread_pct:.2f}% too wide"}
+            # Calculate average volume from recent bars
+            avg_volume = sum(bar.volume for bar in bars[-20:]) / min(20, len(bars))
             
-            # Check volume (if available)
-            volume = ticker_data.volume if ticker_data.volume else 0
+            if avg_volume < 1000:
+                return {"valid": False, "reason": f"Volume {int(avg_volume)} too low"}
             
-            if volume > 0 and volume < 10000:
-                return {"valid": False, "reason": f"Volume {volume} too low"}
-            
-            # Cancel market data subscription
-            self.ib.cancelMktData(contract)
+            # Calculate spread from high-low range (approximate)
+            spread_pct = ((recent_bar.high - recent_bar.low) / recent_bar.close) * 100
             
             return {
                 "valid": True,
                 "spread": round(spread_pct, 3),
-                "volume": int(volume) if volume else 0
+                "volume": int(avg_volume)
             }
             
         except Exception as e:
@@ -886,9 +917,15 @@ class PreMarketMomentumAgent(BaseDayTraderAgent):
         if not self.ib or not self.ib.isConnected():
             try:
                 self.ib = IB()
-                # Python 3.12 fix: Use util.run() to handle event loop properly
+                # Python 3.12 fix: Ensure event loop exists
+                import asyncio
                 import ib_insync.util as ib_util
-                ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=2))
+                try:
+                    asyncio.get_event_loop()
+                except RuntimeError:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                
+                ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=3))
                 self.log(logging.INFO, "Connected to IBKR for pre-market analysis.")
             except Exception as e:
                 self.log(logging.ERROR, f"Failed to connect to IBKR: {e}")
@@ -993,7 +1030,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
     market hours based on technical indicators. It does NOT use an LLM for
     real-time decisions.
     """
-    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.014, stop_loss_pct=0.008):
+    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.018, stop_loss_pct=0.009):
         super().__init__(orchestrator, "IntradayTraderAgent")
         self.allocation = allocation
         self.paper_trade = paper_trade
@@ -1004,6 +1041,21 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.account_summary = {}
         self.capital_per_stock = 0
         self.positions = {} # To track open positions: { 'symbol': {...} }
+        self.pending_orders = {} # Track pending orders: { 'symbol': {'trade': trade_obj, 'action': 'BUY', 'timestamp': time} }
+        self.failed_orders = {} # Track recently failed/cancelled orders: { 'symbol': {'timestamp': time, 'reason': str} }
+        
+        # Daily profit target tracking
+        self.starting_capital = 0  # Set when trading starts (entire account NetLiquidation)
+        self.daily_profit_target = 0.026  # 2.6% whole account target (includes old positions)
+        self.daily_target_reached = False
+        self.sold_stocks = {}  # Track stocks sold at stop loss: {'symbol': {'sold_at': timestamp, 'can_reenter': True}}
+        self.recovery_trades = set()  # Stocks bought after stop loss (accept lower profit target)
+        
+        # MOO (Market-On-Open) state tracking
+        self.moo_placed = False  # Flag: MOO orders placed for today
+        self.moo_monitored = False  # Flag: MOO fills monitored at 9:30 AM
+        self.moo_trades = []  # List of MOO trade objects
+        self.moo_stocks = []  # List of stocks with MOO orders
         
         # Autonomous system components
         self.db = get_database()
@@ -1029,11 +1081,18 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             # IB Gateway default is 4001 for both live and paper.
             # TWS default is 7496 for live and 7497 for paper.
             port = 4001 if self.paper_trade else 4001
-            client_id = 2  # Changed to 2 to avoid conflict with other connections
+            client_id = 2  # Use same ID as pre-market phase to avoid conflicts
             self.log(logging.INFO, f"Attempting connection to 127.0.0.1:{port} with clientId={client_id}...")
             
-            # Python 3.12 fix: Use util.run() with proper event loop handling
+            # Python 3.12 fix: Ensure event loop exists before connecting
+            import asyncio
             import ib_insync.util as ib_util
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                # Create new event loop if none exists
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            
             ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id))
             
             # Verify connection
@@ -1048,22 +1107,40 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             raise ConnectionError("Could not connect to IBKR. Is TWS or Gateway running?")
 
     def _load_watchlist(self):
-        """Loads the watchlist from the JSON file."""
+        """Loads the watchlist from the JSON file with intraday momentum data."""
         self.log(logging.INFO, "Loading day trading watchlist...")
         try:
-            with open("day_trading_watchlist.json", 'r', encoding='utf-8-sig') as f:
-                self.watchlist_data = json.load(f) # This is now a list of dicts
+            # Try loading from day_trading_watchlist.json (intraday scanner)
+            watchlist_path = "day_trading_watchlist.json"
+            if os.path.exists(watchlist_path):
+                with open(watchlist_path, 'r', encoding='utf-8-sig') as f:
+                    self.watchlist_data = json.load(f)
+                self.log(logging.INFO, f"Loaded {len(self.watchlist_data)} stocks from intraday scanner (day_trading_watchlist.json)")
+            else:
+                # Fallback to ranked_tickers.json (pre-market analysis)
+                with open("ranked_tickers.json", 'r', encoding='utf-8-sig') as f:
+                    self.watchlist_data = json.load(f)
+                self.log(logging.INFO, f"Loaded {len(self.watchlist_data)} stocks from pre-market analysis (ranked_tickers.json)")
             
             if not self.watchlist_data:
                 self.log(logging.WARNING, "Watchlist is empty after loading. No trades will be executed.")
             else:
                 loaded_tickers = [item.get('ticker') for item in self.watchlist_data]
-                self.log(logging.INFO, f"Loaded {len(self.watchlist_data)} stocks in the watchlist: {loaded_tickers}")
+                self.log(logging.INFO, f"Active watchlist: {loaded_tickers}")
+                
+                # Log momentum data for verification
+                for item in self.watchlist_data[:5]:  # Show top 5
+                    ticker = item.get('ticker')
+                    confidence = item.get('confidence_score', 0)
+                    reasoning = item.get('reasoning', '')
+                    self.log(logging.INFO, f"  {ticker}: {confidence:.0f}% confidence - {reasoning[:100]}...")
+                    
         except FileNotFoundError:
-            self.log(logging.ERROR, "day_trading_watchlist.json not found. Pre-market analysis must run first.")
+            self.log(logging.ERROR, "Neither day_trading_watchlist.json nor ranked_tickers.json found. Cannot trade.")
+            self.watchlist_data = []
             self.watchlist_data = []
         except json.JSONDecodeError as e:
-            self.log(logging.ERROR, f"Could not decode day_trading_watchlist.json: {e}. The file might be corrupt.")
+            self.log(logging.ERROR, f"Could not decode ranked_tickers.json: {e}. The file might be corrupt.")
             self.watchlist_data = []
 
     def _calculate_capital(self):
@@ -1081,22 +1158,29 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.account_summary = {item.tag: item.value for item in acc_summary_list}
 
             # Find available cash and total account value
-            available_cash = float(self.account_summary.get('AvailableFunds', 0))
+            # Use ExcessLiquidity - this is the ACTUAL buying power available even with PDT restrictions
+            excess_liquidity = float(self.account_summary.get('ExcessLiquidity', 0))
             net_liquidation = float(self.account_summary.get('NetLiquidation', 0))
+            settled_cash = float(self.account_summary.get('SettledCash', 0))
 
-            self.log(logging.INFO, f"Account Summary: Available Funds: ${available_cash}, Net Liquidation: ${net_liquidation}")
+            self.log(logging.INFO, f"Account Summary: Excess Liquidity: ${excess_liquidity:.2f}, Net Liquidation: ${net_liquidation:.2f}, Settled Cash: ${settled_cash:.2f}")
 
             # Determine the total capital to use for day trading
-            total_day_trading_capital = net_liquidation * self.allocation
+            # For PDT-restricted accounts, use ExcessLiquidity which represents real buying power
+            total_day_trading_capital = excess_liquidity * self.allocation
 
-            # Ensure we don't use more than the available cash
-            if total_day_trading_capital > available_cash:
-                self.log(logging.WARNING, f"Requested allocation (${total_day_trading_capital:.2f}) exceeds available cash (${available_cash:.2f}). Using available cash as the limit.")
-                total_day_trading_capital = available_cash
+            # Safety check: ensure we have meaningful capital
+            if total_day_trading_capital < 50:
+                self.log(logging.WARNING, f"Excess liquidity too low (${excess_liquidity:.2f}). Cannot trade with ${total_day_trading_capital:.2f}.")
+                return
 
             # Calculate capital per stock
             self.capital_per_stock = total_day_trading_capital / len(self.watchlist_data)
             self.log(logging.INFO, f"Total capital for day trading: ${total_day_trading_capital:.2f}. Capital per stock: ${self.capital_per_stock:.2f}")
+            
+            # Set starting capital for daily P&L tracking
+            self.starting_capital = net_liquidation
+            self.log(logging.INFO, f"Starting capital for daily P&L tracking: ${self.starting_capital:.2f}")
 
         except Exception as e:
             self.log(logging.ERROR, f"Error calculating capital: {e}")
@@ -1122,15 +1206,41 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                 # Only sync positions for stocks in our watchlist
                 watchlist_symbols = [item.get('ticker') for item in self.watchlist_data]
                 if symbol in watchlist_symbols:
+                    quantity = abs(pos.position)
+                    entry_price = pos.avgCost
+                    contract = Stock(symbol, 'SMART', 'USD')
+                    
+                    # CRITICAL: Qualify contract with IBKR before placing order
+                    self.ib.qualifyContracts(contract)
+                    
+                    # Calculate profit target and stop loss
+                    take_profit = entry_price * (1 + self.profit_target_pct)
+                    stop_loss_price = entry_price * (1 - self.stop_loss_pct)
+                    
+                    # Place profit target order (LimitOrder)
+                    tp_order = LimitOrder('SELL', quantity, take_profit)
+                    tp_order.tif = 'DAY'  # Good for today only
+                    tp_order.outsideRth = True
+                    tp_order.transmit = True
+                    tp_trade = self.ib.placeOrder(contract, tp_order)
+                    self.ib.sleep(1.0)  # Increased wait time for order to process
+                    
+                    self.log(logging.INFO, f"SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
+                    self.log(logging.INFO, f"   Placed profit target: SELL {quantity} @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%)")
+                    self.log(logging.INFO, f"   Order status: {tp_trade.orderStatus.status}, Order ID: {tp_trade.order.orderId}")
+                    
                     # Create position entry in our tracking dictionary
                     self.positions[symbol] = {
-                        "quantity": abs(pos.position),  # Use absolute value
-                        "entry_price": pos.avgCost,
-                        "contract": Stock(symbol, 'SMART', 'USD'),
-                        "atr_pct": None  # Unknown from IBKR, will be recalculated
+                        "quantity": quantity,
+                        "entry_price": entry_price,
+                        "contract": contract,
+                        "atr_pct": None,  # Unknown from IBKR, will be recalculated
+                        "take_profit_trade": tp_trade,
+                        "stop_loss_price": stop_loss_price,
+                        "entry_type": "SYNCED",
+                        "entry_time": time.time()
                     }
                     synced_count += 1
-                    self.log(logging.INFO, f"SYNCED position: {symbol} - {abs(pos.position)} shares @ ${pos.avgCost:.4f}")
                 else:
                     self.log(logging.WARNING, f"Found position for {symbol} ({pos.position} shares @ ${pos.avgCost:.4f}) but it's NOT in today's watchlist. Will not manage this position.")
             
@@ -1143,6 +1253,281 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.log(logging.ERROR, f"Error syncing positions from IBKR: {e}")
             import traceback
             self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
+
+    def _check_daily_profit_target(self):
+        """
+        Check if we've reached the daily profit target of 2.6% on the ENTIRE account.
+        This includes old positions (not just today's trades).
+        Returns True if target is reached, False otherwise.
+        """
+        try:
+            # Get current account value (includes ALL positions - old and new)
+            self.account_summary = {item.tag: item.value for item in self.ib.accountSummary() if item.tag in ['NetLiquidation', 'UnrealizedPnL', 'RealizedPnL']}
+            current_value = float(self.account_summary.get('NetLiquidation', self.starting_capital))
+            
+            # Calculate daily profit for ENTIRE account
+            daily_profit = current_value - self.starting_capital
+            daily_profit_pct = (daily_profit / self.starting_capital) * 100 if self.starting_capital > 0 else 0
+            
+            self.log(logging.INFO, f"Whole Account P&L: ${daily_profit:+.2f} ({daily_profit_pct:+.2f}%) | Target: +{self.daily_profit_target*100}%")
+            
+            # Check if we've hit the 2.6% target on entire account
+            if daily_profit_pct >= (self.daily_profit_target * 100):
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.log(logging.ERROR, f"Error checking daily profit target: {e}")
+            return False
+
+    def _place_moo_orders(self):
+        """
+        Place Market-On-Open (MOO) orders for top momentum stocks.
+        Called once between 9:20-9:27 AM ET.
+        Captures opening price momentum instead of entering late.
+        """
+        self.log(logging.INFO, "=" * 80)
+        self.log(logging.INFO, "MOO PLACEMENT PHASE - Market-On-Open Orders")
+        self.log(logging.INFO, "=" * 80)
+        
+        # FIRST: Check existing orders in IBKR and cancel duplicates
+        self.log(logging.INFO, "Checking for existing orders in IBKR...")
+        existing_trades = self.ib.openTrades()
+        
+        if existing_trades:
+            self.log(logging.INFO, f"Found {len(existing_trades)} existing orders in IBKR")
+            for trade in existing_trades:
+                symbol = trade.contract.symbol
+                action = trade.order.action
+                qty = int(trade.order.totalQuantity)
+                order_type = trade.order.orderType
+                status = trade.orderStatus.status
+                
+                self.log(logging.INFO, f"  Existing: {symbol} {action} {qty} ({order_type}, {status})")
+                
+                # Cancel existing MOO/MKT orders to avoid duplicates
+                if action == 'BUY' and order_type == 'MKT' and status in ['PreSubmitted', 'Submitted']:
+                    self.log(logging.WARNING, f"Cancelling existing order for {symbol} to avoid duplicate")
+                    self.ib.cancelOrder(trade.order)
+                    self.ib.sleep(0.5)
+        else:
+            self.log(logging.INFO, "No existing orders found in IBKR")
+        
+        # Get top stocks from watchlist (already loaded)
+        max_moo_orders = min(5, 4 - len(self.positions))  # Leave room for scanner entries
+        
+        if not self.watchlist_data:
+            self.log(logging.WARNING, "No stocks in watchlist for MOO orders")
+            return
+        
+        if len(self.positions) >= 4:
+            self.log(logging.WARNING, "Already at max positions, skipping MOO orders")
+            return
+        
+        # Select top stocks
+        top_stocks = self.watchlist_data[:max_moo_orders]
+        self.log(logging.INFO, f"Selected {len(top_stocks)} stocks for MOO orders:")
+        for item in top_stocks:
+            symbol = item.get('ticker')
+            confidence = item.get('confidence_score', 0)
+            self.log(logging.INFO, f"  • {symbol} ({confidence:.0f}% confidence)")
+        
+        # Place MOO orders
+        for item in top_stocks:
+            symbol = item.get('ticker')
+            
+            # Skip if already have position or pending order
+            if symbol in self.positions:
+                self.log(logging.INFO, f"Skipping {symbol} - already have position")
+                continue
+            
+            try:
+                # Create contract
+                contract = Stock(symbol, 'SMART', 'USD')
+                self.ib.qualifyContracts(contract)
+                
+                # Try to get price using reqMktData first (might have cached data)
+                self.ib.reqMarketDataType(3)  # Delayed/frozen data
+                ticker = self.ib.reqMktData(contract, '', False, False)
+                self.ib.sleep(2)
+                
+                # Check if we got valid prices
+                import math
+                price_sources = [ticker.last, ticker.close, ticker.bid, ticker.ask, ticker.marketPrice()]
+                valid_prices = [p for p in price_sources if p and not math.isnan(p) and p > 0]
+                
+                # Cancel the subscription
+                self.ib.cancelMktData(contract)
+                
+                if valid_prices:
+                    # Got price data successfully!
+                    estimated_price = valid_prices[0]
+                    self.log(logging.INFO, f"Price for {symbol}: ${estimated_price:.2f}")
+                else:
+                    # No price data - try reconnecting to get fresh cached data
+                    self.log(logging.WARNING, f"No price data for {symbol}, reconnecting to IBKR for fresh data...")
+                    
+                    # Disconnect
+                    self.ib.disconnect()
+                    self.ib.sleep(1)
+                    
+                    # Reconnect
+                    import asyncio
+                    import ib_insync.util as ib_util
+                    try:
+                        asyncio.get_event_loop()
+                    except RuntimeError:
+                        asyncio.set_event_loop(asyncio.new_event_loop())
+                    
+                    ib_util.run(self.ib.connectAsync('127.0.0.1', 4001, clientId=2))
+                    self.log(logging.INFO, f"Reconnected to IBKR")
+                    
+                    # Try again with fresh connection
+                    contract = Stock(symbol, 'SMART', 'USD')
+                    self.ib.qualifyContracts(contract)
+                    
+                    self.ib.reqMarketDataType(3)
+                    ticker = self.ib.reqMktData(contract, '', False, False)
+                    self.ib.sleep(2)
+                    
+                    price_sources = [ticker.last, ticker.close, ticker.bid, ticker.ask, ticker.marketPrice()]
+                    valid_prices = [p for p in price_sources if p and not math.isnan(p) and p > 0]
+                    self.ib.cancelMktData(contract)
+                    
+                    if valid_prices:
+                        estimated_price = valid_prices[0]
+                        self.log(logging.INFO, f"Price for {symbol}: ${estimated_price:.2f} (after reconnect)")
+                    else:
+                        # Still no data - fall back to historical
+                        self.log(logging.WARNING, f"Still no price data after reconnect, using historical data")
+                        bars = self.ib.reqHistoricalData(
+                            contract,
+                            endDateTime='',
+                            durationStr='1 D',
+                            barSizeSetting='1 day',
+                            whatToShow='TRADES',
+                            useRTH=False
+                        )
+                        
+                        if bars and len(bars) > 0:
+                            estimated_price = bars[-1].close
+                            self.log(logging.INFO, f"Price for {symbol}: ${estimated_price:.2f} (yesterday's close)")
+                        else:
+                            self.log(logging.WARNING, f"No historical data for {symbol}, skipping")
+                            continue
+                
+                # Calculate shares
+                shares = int(self.capital_per_stock / estimated_price)
+                
+                if shares < 1:
+                    self.log(logging.WARNING, f"Insufficient capital for {symbol} @ ${estimated_price:.2f}, skipping")
+                    continue
+                
+                # Create Market order (will execute at market open)
+                moo_order = Order()
+                moo_order.action = 'BUY'
+                moo_order.totalQuantity = shares
+                moo_order.orderType = 'MKT'  # Simple Market order
+                moo_order.tif = 'DAY'
+                moo_order.outsideRth = True
+                moo_order.transmit = True
+                
+                # Place order
+                trade = self.ib.placeOrder(contract, moo_order)
+                
+                self.log(logging.INFO, f"MOO order placed: {symbol} x{shares} shares @ ~${estimated_price:.2f}")
+                
+                # Track MOO trade
+                self.moo_trades.append({
+                    'symbol': symbol,
+                    'trade': trade,
+                    'shares': shares,
+                    'estimated_price': estimated_price,
+                    'contract': contract
+                })
+                self.moo_stocks.append(symbol)
+                
+            except Exception as e:
+                self.log(logging.ERROR, f"Failed to place MOO order for {symbol}: {e}")
+        
+        self.moo_placed = True
+        self.log(logging.INFO, f"MOO placement complete: {len(self.moo_trades)} orders placed")
+        self.log(logging.INFO, f"MOO stocks: {self.moo_stocks}")
+
+    def _monitor_moo_fills(self):
+        """
+        Monitor MOO order fills at market open (9:30 AM).
+        Place profit targets immediately after fills.
+        Add filled positions to tracking.
+        """
+        self.log(logging.INFO, "=" * 80)
+        self.log(logging.INFO, "MOO FILL MONITORING - Checking Market Open Executions")
+        self.log(logging.INFO, "=" * 80)
+        
+        if not self.moo_trades:
+            self.log(logging.INFO, "No MOO trades to monitor")
+            return
+        
+        # Wait 30 seconds for fills at market open
+        self.log(logging.INFO, "Waiting for MOO fills (30 seconds)...")
+        
+        for i in range(30):
+            self.ib.sleep(1)
+            
+            # Check each MOO trade
+            for moo in self.moo_trades:
+                # Skip if already processed
+                if moo.get('processed'):
+                    continue
+                
+                trade = moo['trade']
+                symbol = moo['symbol']
+                contract = moo['contract']
+                status = trade.orderStatus.status
+                
+                if status == 'Filled':
+                    # MOO filled!
+                    fill_price = trade.orderStatus.avgFillPrice
+                    filled_qty = trade.orderStatus.filled
+                    
+                    self.log(logging.INFO, f"MOO FILLED: {symbol} - {filled_qty} shares @ ${fill_price:.2f}")
+                    
+                    # Calculate profit target and stop loss
+                    take_profit = fill_price * (1 + self.profit_target_pct)
+                    stop_loss = fill_price * (1 - self.stop_loss_pct)
+                    
+                    # Place profit target (LimitOrder)
+                    tp_order = LimitOrder('SELL', filled_qty, take_profit)
+                    tp_trade = self.ib.placeOrder(contract, tp_order)
+                    
+                    self.log(logging.INFO, f"   Profit target: ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%)")
+                    self.log(logging.INFO, f"   Stop loss: ${stop_loss:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                    
+                    # Add to positions (SAME dict as scanner entries)
+                    self.positions[symbol] = {
+                        "quantity": filled_qty,
+                        "entry_price": fill_price,
+                        "contract": contract,
+                        "atr_pct": None,  # No ATR for MOO entries
+                        "take_profit_trade": tp_trade,
+                        "stop_loss_price": stop_loss,
+                        "entry_type": "MOO",  # Tag as MOO entry
+                        "entry_time": time.time()
+                    }
+                    
+                    moo['processed'] = True
+                    
+                elif status in ['Cancelled', 'ApiCancelled', 'Inactive']:
+                    self.log(logging.WARNING, f"MOO FAILED: {symbol} - {status}")
+                    moo['processed'] = True
+        
+        # Summary
+        filled_count = sum(1 for m in self.moo_trades if m.get('processed') and 
+                          m['trade'].orderStatus.status == 'Filled')
+        
+        self.log(logging.INFO, f"MOO fill monitoring complete: {filled_count}/{len(self.moo_trades)} filled")
+        self.moo_monitored = True
 
     def _run_trading_loop(self):
         """
@@ -1182,12 +1567,140 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         try:
             # Run until market close (no time limit)
             loop_start_time = time.time()
+            last_scanner_run = 0  # Track when we last ran the intraday scanner
+            scanner_interval = 900  # Run scanner every 15 minutes (900 seconds)
             
             self.log(logging.INFO, f"Entering trading loop - will run until market close...")
             self.log(logging.INFO, f"Loop start time: {loop_start_time}, Market open: {is_market_open()}")
+            self.log(logging.INFO, f"Scanner will refresh watchlist every {scanner_interval/60:.0f} minutes")
             
             while is_market_open():
                 self.log(logging.INFO, "Trading loop iteration starting...")
+                
+                # --- 15-MINUTE SCANNER REFRESH ---
+                # Run intraday scanner every 15 minutes to find fresh momentum stocks
+                time_since_last_scan = time.time() - last_scanner_run
+                if time_since_last_scan >= scanner_interval:
+                    self.log(logging.INFO, f"Running 15-min intraday scanner (last scan {time_since_last_scan/60:.1f} min ago)...")
+                    try:
+                        import subprocess
+                        import sys
+                        
+                        # Run the Polygon intraday scanner
+                        result = subprocess.run(
+                            [sys.executable, 'intraday_scanner_polygon.py'],
+                            capture_output=True,
+                            text=True,
+                            timeout=120  # 2-minute timeout
+                        )
+                        
+                        if result.returncode == 0:
+                            self.log(logging.INFO, "Intraday scanner completed successfully. Reloading watchlist...")
+                            
+                            # Reload the updated watchlist
+                            old_tickers = [item.get('ticker') for item in self.watchlist_data]
+                            self._load_watchlist()
+                            new_tickers = [item.get('ticker') for item in self.watchlist_data]
+                            
+                            # Log changes
+                            added = set(new_tickers) - set(old_tickers)
+                            removed = set(old_tickers) - set(new_tickers)
+                            
+                            if added:
+                                self.log(logging.INFO, f"NEW momentum stocks added: {list(added)}")
+                            if removed:
+                                self.log(logging.INFO, f"Stocks removed from watchlist: {list(removed)}")
+                            if not added and not removed:
+                                self.log(logging.INFO, "Watchlist unchanged - same hot stocks still active")
+                            
+                            # Update contracts list for new watchlist
+                            contracts_for_data = []
+                            for item in self.watchlist_data:
+                                ticker = item.get('ticker')
+                                if ticker:
+                                    contracts_for_data.append(Stock(ticker, 'SMART', 'USD'))
+                            
+                            self.log(logging.INFO, f"Trading {len(contracts_for_data)} stocks after refresh")
+                            last_scanner_run = time.time()
+                        else:
+                            self.log(logging.WARNING, f"Scanner failed with exit code {result.returncode}: {result.stderr[:200]}")
+                    except subprocess.TimeoutExpired:
+                        self.log(logging.WARNING, "Scanner timed out after 2 minutes. Will retry next interval.")
+                    except Exception as e:
+                        self.log(logging.ERROR, f"Error running scanner: {e}. Continuing with current watchlist.")
+                
+                # Check if we've hit daily profit target
+                if self._check_daily_profit_target():
+                    self.log(logging.INFO, "DAILY PROFIT TARGET REACHED! Liquidating all positions and stopping trading.")
+                    self._liquidate_positions()
+                    self.daily_target_reached = True
+                    break
+                
+                # Check pending orders first
+                pending_to_remove = []
+                for symbol, pending_info in list(self.pending_orders.items()):
+                    trade = pending_info['trade']
+                    age = time.time() - pending_info['timestamp']
+                    
+                    # Update order status
+                    self.ib.sleep(0.1)
+                    
+                    if trade.orderStatus.status == 'Filled':
+                        fill_price = trade.orderStatus.avgFillPrice
+                        filled_quantity = trade.orderStatus.filled
+                        
+                        if pending_info['action'] == 'BUY':
+                            self.positions[symbol] = {
+                                "quantity": filled_quantity,
+                                "entry_price": fill_price,
+                                "contract": pending_info['contract'],
+                                "atr_pct": pending_info.get('atr_pct')
+                            }
+                            self.log(logging.INFO, f"PENDING BUY FILLED: {filled_quantity} shares of {symbol} at ${fill_price:.2f}")
+                            
+                            # Log to database
+                            capital = float(self.account_summary.get('NetLiquidation', 0))
+                            self.db.log_trade({
+                                'symbol': symbol,
+                                'action': 'BUY',
+                                'quantity': filled_quantity,
+                                'price': fill_price,
+                                'agent_name': self.agent_name,
+                                'reason': f'Entry signal filled after {age:.1f}s',
+                                'capital_at_trade': capital,
+                                'position_size_pct': (filled_quantity * fill_price / capital * 100) if capital > 0 else 0,
+                                'metadata': {
+                                    'vwap': 0,
+                                    'rsi': 0,
+                                    'atr_pct': pending_info.get('atr_pct', 0),
+                                    'current_price': fill_price
+                                }
+                            })
+                        
+                        pending_to_remove.append(symbol)
+                    
+                    elif trade.orderStatus.status in ['Cancelled', 'Inactive']:
+                        self.log(logging.WARNING, f"Order for {symbol} was {trade.orderStatus.status}. Marking as failed to prevent immediate retry.")
+                        # Track failed order with timestamp to prevent immediate retry
+                        self.failed_orders[symbol] = {
+                            'timestamp': time.time(),
+                            'reason': trade.orderStatus.status,
+                            'price_at_fail': pending_info.get('current_price', 0)
+                        }
+                        pending_to_remove.append(symbol)
+                    
+                    elif age > 30:  # Cancel if pending for more than 30 seconds
+                        self.log(logging.WARNING, f"Order for {symbol} pending for {age:.0f}s. Cancelling.")
+                        self.ib.cancelOrder(trade.order)
+                        pending_to_remove.append(symbol)
+                
+                # Clean up filled/cancelled orders
+                for symbol in pending_to_remove:
+                    del self.pending_orders[symbol]
+                
+                if self.pending_orders:
+                    self.log(logging.INFO, f"Pending orders: {list(self.pending_orders.keys())}")
+                
                 self.log(logging.INFO, f"Processing {len(contracts_for_data)} contracts...")
                 
                 # AUTONOMOUS: Periodic health check
@@ -1206,15 +1719,15 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         self.log(logging.INFO, f"Fetching historical data for {contract.symbol}...")
                         
                         # Get historical data to calculate indicators - try IBKR first, fallback to Polygon
-                        # Request 2 days of data to ensure we have enough bars for RSI_14 calculation
+                        # Request historical data with real-time subscription
                         df = None
                         try:
                             try:
                                 bars = self.ib.reqHistoricalData(
                                     contract,
                                     endDateTime='',
-                                    durationStr='2 D',
-                                    barSizeSetting='1 min',
+                                    durationStr='10800 S',  # Last 10800 seconds (3 hours / ~360 bars) for better VWAP/RSI/ATR with real-time data
+                                    barSizeSetting='30 secs',
                                     whatToShow='TRADES',
                                     useRTH=True,
                                     formatDate=1
@@ -1323,39 +1836,168 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         # --- Trade Decision Logic ---
                         position = self.positions.get(contract.symbol)
 
-                        # Entry Logic: No position is open
-                        if position is None:
-                            # Enhanced entry with ATR volatility check
-                            # Only enter if: Price > VWAP, RSI < 60, and ATR shows decent volatility (>1.5%)
-                            atr_requirement = atr_pct is None or atr_pct >= 1.5  # If ATR unavailable, allow entry
+                        # Entry Logic: No position is open AND no pending order AND not recently failed
+                        if position is None and contract.symbol not in self.pending_orders:
+                            # Check if order recently failed/cancelled (wait before retry)
+                            if contract.symbol in self.failed_orders:
+                                failed_info = self.failed_orders[contract.symbol]
+                                failed_time = failed_info['timestamp']
+                                failed_reason = failed_info.get('reason', 'unknown')
+                                time_since_fail = time.time() - failed_time
+                                
+                                # Different cooldowns based on failure reason
+                                if failed_reason == 'stop_loss':
+                                    cooldown_seconds = 300  # 5 minutes for stop loss
+                                else:
+                                    cooldown_seconds = 60  # 60 seconds for cancelled orders
+                                
+                                if time_since_fail < cooldown_seconds:
+                                    continue  # Still in cooldown, skip this stock
+                                else:
+                                    # Enough time has passed, allow retry and remove from failed list
+                                    self.log(logging.INFO, f"Retry allowed for {contract.symbol} after {time_since_fail:.0f}s cooldown")
+                                    del self.failed_orders[contract.symbol]
                             
-                            if current_price > vwap and rsi < 60 and atr_requirement:
+                            # DATABASE COORDINATION: Check if position already exists or was closed today
+                            # This prevents conflicts with Exit Manager and duplicate entries
+                            if self.db.is_position_active(contract.symbol):
+                                self.log(logging.INFO, f"⏭️  Skipping {contract.symbol} - position already active (database check)")
+                                continue
+                            
+                            if self.db.was_closed_today(contract.symbol):
+                                self.log(logging.INFO, f"⏭️  Skipping {contract.symbol} - already traded today (re-entry protection)")
+                                continue
+                            
+                            # Check if this stock was previously sold (don't re-enter unless it's a recovery trade)
+                            if contract.symbol in self.sold_stocks and not self.sold_stocks[contract.symbol].get('can_reenter', False):
+                                # Stock was sold for profit - don't re-enter
+                                continue
+                            
+                            # Calculate pre-market gap from watchlist data
+                            ticker_info = next((t for t in self.watchlist_data if t.get('ticker') == contract.symbol), None)
+                            pre_market_gap = 0
+                            if ticker_info and 'premarket_change' in ticker_info:
+                                pre_market_gap = abs(ticker_info.get('premarket_change', 0))
+                            
+                            # Enhanced entry with TWO paths:
+                            # Path 1: Gap-and-Go (5%+ pre-market gap - VWAP not required for momentum plays)
+                            # Path 2: Standard Entry (Price > VWAP + ATR check)
+                            gap_entry = pre_market_gap >= 5.0  # 5%+ gap qualifies for momentum entry
+                            standard_entry = current_price > vwap and (atr_pct is None or atr_pct >= 0.3)  # 0.3% for 30-sec bars
+                            
+                            # Gap plays bypass VWAP requirement (momentum continuation), standard plays require VWAP
+                            if rsi < 60 and (gap_entry or standard_entry):
                                 quantity = int(self.capital_per_stock / current_price)
                                 if quantity > 0:
-                                    atr_info = f", ATR {atr_pct:.2f}% (volatile)" if atr_pct else ""
-                                    self.log(logging.INFO, f"ENTRY SIGNAL for {contract.symbol}: Price ${current_price} > VWAP ${vwap:.2f}, RSI {rsi:.2f} < 60{atr_info}. Buying {quantity} shares.")
+                                    # Determine entry reason for logging
+                                    if gap_entry:
+                                        entry_reason = f"Gap-and-Go {pre_market_gap:.1f}% (momentum play)"
+                                    else:
+                                        entry_reason = f"Price>${vwap:.2f} VWAP, ATR {atr_pct:.2f}%"
+                                    self.log(logging.INFO, f"ENTRY SIGNAL for {contract.symbol}: RSI {rsi:.2f} < 60, {entry_reason}. Buying {quantity} shares.")
                                     
-                                    # *** Use SMART routing for the best order execution price ***
+                                    # *** BUY FIRST, then place take profit + stop loss AFTER confirmation ***
                                     trade_contract = Stock(contract.symbol, 'SMART', 'USD')
-                                    order = MarketOrder('BUY', quantity)
+                                    
+                                    # Calculate profit target (+2.6%) and stop loss (-0.9%)
+                                    take_profit_price = current_price * 1.026  # +2.6%
+                                    stop_loss_price = current_price * 0.991    # -0.9%
+                                    
+                                    self.log(logging.INFO, f"Placing BUY order for {contract.symbol}: {quantity} shares @ market (TP=${take_profit_price:.2f}, SL=${stop_loss_price:.2f})")
                                     
                                     # AUTONOMOUS: Trace trade execution
                                     with self.tracer.trace_trade_execution(contract.symbol, 'BUY'):
-                                        trade = self.ib.placeOrder(trade_contract, order)
-                                        time.sleep(1)
+                                        # Step 1: Place MARKET BUY order first
+                                        buy_order = MarketOrder('BUY', quantity)
+                                        parent_trade = self.ib.placeOrder(trade_contract, buy_order)
                                         
-                                        if trade.orderStatus.status == 'Filled':
-                                            fill_price = trade.orderStatus.avgFillPrice
-                                            filled_quantity = trade.orderStatus.filled
+                                        # Track pending order immediately
+                                        self.pending_orders[contract.symbol] = {
+                                            'trade': parent_trade,
+                                            'action': 'BUY',
+                                            'quantity': quantity,
+                                            'timestamp': time.time(),
+                                            'contract': contract,
+                                            'atr_pct': atr_pct,
+                                            'take_profit_price': take_profit_price,
+                                            'stop_loss_price': stop_loss_price
+                                        }
+                                        
+                                        # Wait up to 3 seconds for BUY to fill
+                                        for _ in range(6):
+                                            time.sleep(0.5)
+                                            if parent_trade.orderStatus.status == 'Filled':
+                                                break
+                                        
+                                        if parent_trade.orderStatus.status == 'Filled':
+                                            fill_price = parent_trade.orderStatus.avgFillPrice
+                                            filled_quantity = parent_trade.orderStatus.filled
                                             
+                                            self.log(logging.INFO, f"BUY FILLED: {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
+                                            
+                                            # Step 2: NOW place take profit and stop loss orders AFTER BUY confirmed
+                                            # Recalculate based on ACTUAL fill price
+                                            actual_take_profit = fill_price * 1.026  # +2.6% from actual fill
+                                            actual_stop_loss = fill_price * 0.991    # -0.9% from actual fill
+                                            
+                                            # Place Take Profit limit order (IBKR allows this for closing long position)
+                                            take_profit_order = LimitOrder('SELL', filled_quantity, actual_take_profit)
+                                            tp_trade = self.ib.placeOrder(trade_contract, take_profit_order)
+                                            
+                                            # NOTE: No Stop Loss order - IBKR rejects Stop SELL orders as short-sells
+                                            # Bot will monitor price and place MarketOrder when stop loss hit
+                                            
+                                            self.log(logging.INFO, f"Take Profit order placed @ ${actual_take_profit:.2f} (TP), Stop Loss @ ${actual_stop_loss:.2f} (bot-monitored)")
+                                            
+                                            # Store position with bracket order references
                                             self.positions[contract.symbol] = {
                                                 "quantity": filled_quantity,
                                                 "entry_price": fill_price,
-                                                "contract": contract, # Store original data contract
-                                                "atr_pct": atr_pct  # Store ATR at entry for reference
+                                                "contract": contract,
+                                                "atr_pct": atr_pct,
+                                                "take_profit_trade": tp_trade,  # Reference to TP order
+                                                "stop_loss_price": actual_stop_loss,  # Bot monitors this
+                                                "take_profit_price": actual_take_profit
                                             }
                                             
-                                            self.log(logging.INFO, f"BOUGHT {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
+                                            # DATABASE COORDINATION: Register position in shared database
+                                            # This allows Exit Manager to see and manage this position
+                                            self.db.add_active_position(
+                                                symbol=contract.symbol,
+                                                quantity=filled_quantity,
+                                                entry_price=fill_price,
+                                                agent_name='day_trader',
+                                                profit_target=actual_take_profit,
+                                                stop_loss=actual_stop_loss
+                                            )
+                                            
+                                            # DATABASE: Log the entry trade
+                                            self.db.log_trade({
+                                                'symbol': contract.symbol,
+                                                'action': 'BUY',
+                                                'quantity': filled_quantity,
+                                                'price': fill_price,
+                                                'agent_name': 'day_trader',
+                                                'reason': entry_reason,
+                                                'metadata': {
+                                                    'rsi': rsi,
+                                                    'vwap': vwap,
+                                                    'atr_pct': atr_pct,
+                                                    'pre_market_gap': pre_market_gap,
+                                                    'take_profit': actual_take_profit,
+                                                    'stop_loss': actual_stop_loss
+                                                }
+                                            })
+                                            
+                                            self.log(logging.INFO, f"✅ Position registered in database: {contract.symbol} @ ${fill_price:.2f}")
+                                            
+                                            # Mark as recovery trade if re-entering after stop loss
+                                            if contract.symbol in self.sold_stocks and self.sold_stocks[contract.symbol].get('can_reenter'):
+                                                self.recovery_trades.add(contract.symbol)
+                                                self.log(logging.INFO, f"RECOVERY TRADE for {contract.symbol} - bracket orders active")
+                                            
+                                            # Remove from pending
+                                            del self.pending_orders[contract.symbol]
                                             
                                             # AUTONOMOUS: Log trade to database
                                             capital = float(self.account_summary.get('NetLiquidation', 0))
@@ -1376,104 +2018,158 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                                 }
                                             })
                                         else:
-                                            self.log(logging.WARNING, f"Buy order for {contract.symbol} not filled immediately. Status: {trade.orderStatus.status}")
+                                            self.log(logging.WARNING, f"Buy order for {contract.symbol} not filled after 3 seconds. Status: {parent_trade.orderStatus.status}. Will check next iteration.")
                             else:
                                 # Log why we're NOT buying
                                 reasons = []
-                                if not (current_price > vwap):
-                                    reasons.append(f"Price ${current_price:.2f} <= VWAP ${vwap:.2f}")
                                 if not (rsi < 60):
                                     reasons.append(f"RSI {rsi:.2f} >= 60 (overbought)")
-                                if not atr_requirement:
-                                    reasons.append(f"ATR {atr_pct:.2f}% < 1.5% (low volatility)")
+                                if not gap_entry:
+                                    if not (current_price > vwap):
+                                        reasons.append(f"Price ${current_price:.2f} <= VWAP ${vwap:.2f}")
+                                    if not (atr_pct is None or atr_pct >= 0.3):
+                                        reasons.append(f"ATR {atr_pct:.2f}% < 0.3% (low volatility)")
+                                else:
+                                    # Gap play failed - should rarely happen (only RSI issue)
+                                    reasons.append(f"Gap {pre_market_gap:.1f}% but failed other checks")
                                 if reasons:
                                     self.log(logging.INFO, f"NO ENTRY for {contract.symbol}: {', '.join(reasons)}")
                         
-                        # Exit Logic: A position is open
+                        # Exit Logic: A position is open - CHECK IF BRACKET ORDERS EXECUTED
                         else:
+                            # With bracket orders, IBKR handles profit/stop automatically
+                            # We just need to check if position was closed by bracket orders
                             entry_price = position['entry_price']
-                            profit_target = entry_price * (1 + self.profit_target_pct)
-                            stop_loss = entry_price * (1 - self.stop_loss_pct)
-
-                            if current_price >= profit_target:
-                                self.log(logging.INFO, f"PROFIT TARGET for {contract.symbol}: Price ${current_price:.2f} >= Target ${profit_target:.2f}. Selling.")
+                            
+                            # Get bracket order trades (placed AFTER BUY confirmation)
+                            tp_trade = position.get('take_profit_trade', None)
+                            sl_trade = position.get('stop_loss_trade', None)
+                            
+                            if tp_trade and sl_trade:
+                                # Check if take profit order filled
+                                position_closed = False
+                                exit_reason = None
+                                fill_price = None
                                 
-                                # AUTONOMOUS: Trace sell execution
-                                with self.tracer.trace_trade_execution(contract.symbol, 'SELL'):
-                                    trade_contract = Stock(contract.symbol, 'SMART', 'USD')
-                                    order = MarketOrder('SELL', position['quantity'])
-                                    trade = self.ib.placeOrder(trade_contract, order)
-                                    time.sleep(1)
-                                    
-                                    if trade.orderStatus.status == 'Filled':
-                                        fill_price = trade.orderStatus.avgFillPrice
-                                        filled_quantity = trade.orderStatus.filled
-                                        profit_loss = (fill_price - entry_price) * filled_quantity
-                                        profit_loss_pct = ((fill_price - entry_price) / entry_price) * 100
+                                if tp_trade.orderStatus.status == 'Filled':
+                                    position_closed = True
+                                    exit_reason = 'profit_target'
+                                    fill_price = tp_trade.orderStatus.avgFillPrice
+                                    self.log(logging.INFO, f"TAKE PROFIT filled for {contract.symbol} at ${fill_price:.2f}")
+                                
+                                else:
+                                    # Manual stop-loss monitoring (IBKR doesn't allow Stop SELL orders)
+                                    try:
+                                        # Get current market price
+                                        ticker = self.ib.reqMktData(contract, '', False, False)
+                                        self.ib.sleep(0.5)  # Wait for price update
                                         
-                                        # AUTONOMOUS: Log trade to database
-                                        capital = float(self.account_summary.get('NetLiquidation', 0))
-                                        self.db.log_trade({
-                                            'symbol': contract.symbol,
-                                            'action': 'SELL',
-                                            'quantity': filled_quantity,
-                                            'price': fill_price,
-                                            'agent_name': self.agent_name,
-                                            'reason': f'Profit target: ${current_price:.2f} >= ${profit_target:.2f}',
-                                            'profit_loss': profit_loss,
-                                            'profit_loss_pct': profit_loss_pct,
-                                            'capital_at_trade': capital,
-                                            'metadata': {
-                                                'entry_price': entry_price,
-                                                'exit_price': fill_price,
-                                                'target_price': profit_target,
-                                                'current_price': current_price
-                                            }
-                                        })
+                                        current_price = None
+                                        if ticker.last and not math.isnan(ticker.last):
+                                            current_price = ticker.last
+                                        elif ticker.bid and not math.isnan(ticker.bid):
+                                            current_price = ticker.bid
                                         
-                                        self.log(logging.INFO, f"SOLD {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f} for ${profit_loss:+.2f} P&L ({profit_loss_pct:+.2f}%)")
+                                        stop_loss_price = position.get('stop_loss_price')
+                                        
+                                        if current_price and stop_loss_price and current_price <= stop_loss_price:
+                                            # Stop loss triggered - place immediate market sell
+                                            self.log(logging.WARNING, f"🛑 STOP LOSS triggered for {contract.symbol}: ${current_price:.2f} <= ${stop_loss_price:.2f}")
+                                            
+                                            filled_quantity = position['quantity']
+                                            stop_loss_order = MarketOrder('SELL', filled_quantity)
+                                            stop_loss_order.tif = 'IOC'  # Immediate-Or-Cancel
+                                            stop_loss_order.outsideRth = True  # Allow after-hours
+                                            sl_trade = self.ib.placeOrder(contract, stop_loss_order)
+                                            
+                                            # Wait for stop loss fill
+                                            for _ in range(10):
+                                                self.ib.sleep(1)
+                                                if sl_trade.orderStatus.status == 'Filled':
+                                                    position_closed = True
+                                                    exit_reason = 'stop_loss'
+                                                    fill_price = sl_trade.orderStatus.avgFillPrice
+                                                    self.log(logging.INFO, f"STOP LOSS filled for {contract.symbol} at ${fill_price:.2f}")
+                                                    # Cancel the take profit order
+                                                    self.ib.cancelOrder(tp_trade.order)
+                                                    break
+                                        
+                                        # Cancel ticker subscription
+                                        self.ib.cancelMktData(contract)
                                     
+                                    except Exception as e:
+                                        self.log(logging.ERROR, f"Error checking stop loss for {contract.symbol}: {e}")
+                                
+                                # If position was closed by bracket order, log it
+                                if position_closed and fill_price:
+                                    filled_quantity = position['quantity']
+                                    profit_loss = (fill_price - entry_price) * filled_quantity
+                                    profit_loss_pct = ((fill_price - entry_price) / entry_price) * 100
+                                    
+                                    # DATABASE COORDINATION: Remove from active_positions and mark as closed_today
+                                    self.db.remove_active_position(
+                                        symbol=contract.symbol,
+                                        exit_price=fill_price,
+                                        exit_reason=exit_reason.upper(),
+                                        agent_name='day_trader'
+                                    )
+                                    
+                                    # AUTONOMOUS: Log trade to database
+                                    capital = float(self.account_summary.get('NetLiquidation', 0))
+                                    self.db.log_trade({
+                                        'symbol': contract.symbol,
+                                        'action': 'SELL',
+                                        'quantity': filled_quantity,
+                                        'price': fill_price,
+                                        'agent_name': self.agent_name,
+                                        'reason': f'Bracket order: {exit_reason}',
+                                        'profit_loss': profit_loss,
+                                        'profit_loss_pct': profit_loss_pct,
+                                        'capital_at_trade': capital,
+                                        'metadata': {
+                                            'entry_price': entry_price,
+                                            'exit_price': fill_price,
+                                            'exit_reason': exit_reason
+                                        }
+                                    })
+                                    
+                                    self.log(logging.INFO, f"SOLD {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f} for ${profit_loss:+.2f} P&L ({profit_loss_pct:+.2f}%)")
+                                    
+                                    # Handle post-exit logic
+                                    if exit_reason == 'profit_target':
+                                        # Mark as sold for profit - don't re-enter this stock today
+                                        self.sold_stocks[contract.symbol] = {
+                                            'sold_at': time.time(),
+                                            'can_reenter': False,
+                                            'reason': 'profit_target'
+                                        }
+                                        self.recovery_trades.discard(contract.symbol)
+                                    
+                                    elif exit_reason == 'stop_loss':
+                                        # Add to failed_orders with 5-minute cooldown
+                                        self.failed_orders[contract.symbol] = {
+                                            'timestamp': time.time(),
+                                            'reason': 'stop_loss',
+                                            'price_at_fail': fill_price
+                                        }
+                                        self.log(logging.INFO, f"🚫 {contract.symbol} added to cooldown (5 min) after stop loss")
+                                        
+                                        # Mark as sold at stop loss - CAN re-enter after cooldown
+                                        self.sold_stocks[contract.symbol] = {
+                                            'sold_at': time.time(),
+                                            'can_reenter': True,
+                                            'reason': 'stop_loss',
+                                            'last_price': fill_price
+                                        }
+                                        self.log(logging.INFO, f"⚡ {contract.symbol} now eligible for re-entry if momentum recovers (after cooldown)")
+                                    
+                                    # Remove position
                                     del self.positions[contract.symbol]
                             
-                            elif current_price <= stop_loss:
-                                self.log(logging.INFO, f"STOP LOSS for {contract.symbol}: Price ${current_price:.2f} <= Stop ${stop_loss:.2f}. Selling.")
-                                
-                                # AUTONOMOUS: Trace sell execution
-                                with self.tracer.trace_trade_execution(contract.symbol, 'SELL'):
-                                    trade_contract = Stock(contract.symbol, 'SMART', 'USD')
-                                    order = MarketOrder('SELL', position['quantity'])
-                                    trade = self.ib.placeOrder(trade_contract, order)
-                                    time.sleep(1)
-                                    
-                                    if trade.orderStatus.status == 'Filled':
-                                        fill_price = trade.orderStatus.avgFillPrice
-                                        filled_quantity = trade.orderStatus.filled
-                                        profit_loss = (fill_price - entry_price) * filled_quantity
-                                        profit_loss_pct = ((fill_price - entry_price) / entry_price) * 100
-                                        
-                                        # AUTONOMOUS: Log trade to database
-                                        capital = float(self.account_summary.get('NetLiquidation', 0))
-                                        self.db.log_trade({
-                                            'symbol': contract.symbol,
-                                            'action': 'SELL',
-                                            'quantity': filled_quantity,
-                                            'price': fill_price,
-                                            'agent_name': self.agent_name,
-                                            'reason': f'Stop loss: ${current_price:.2f} <= ${stop_loss:.2f}',
-                                            'profit_loss': profit_loss,
-                                            'profit_loss_pct': profit_loss_pct,
-                                            'capital_at_trade': capital,
-                                            'metadata': {
-                                                'entry_price': entry_price,
-                                                'exit_price': fill_price,
-                                                'stop_loss': stop_loss,
-                                                'current_price': current_price
-                                            }
-                                        })
-                                        
-                                        self.log(logging.INFO, f"SOLD {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f} for ${profit_loss:+.2f} P&L ({profit_loss_pct:+.2f}%)")
-                                    
-                                    del self.positions[contract.symbol]
+                            else:
+                                # Fallback: Legacy positions without bracket orders (shouldn't happen with new code)
+                                self.log(logging.WARNING, f"{contract.symbol} position exists but no bracket orders found. Monitoring manually.")
+                                # Keep the old manual monitoring as fallback (but this shouldn't execute for new trades)
 
                     except Exception as e_stock:
                         self.log(logging.ERROR, f"An error occurred while processing {contract.symbol}: {e_stock}")
@@ -1507,15 +2203,53 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                 tracked_symbols.add(symbol)
                 try:
                     trade_contract = Stock(symbol, 'SMART', 'USD')
+                    # Get current price
+                    bars = self.ib.reqHistoricalData(
+                        trade_contract, endDateTime='', durationStr='1 D',
+                        barSizeSetting='1 min', whatToShow='TRADES', useRTH=True
+                    )
+                    if bars:
+                        current_price = bars[-1].close
+                    else:
+                        current_price = position['entry_price']  # Fallback
+                    
                     order = MarketOrder('SELL', position['quantity'])
+                    order.tif = 'IOC'  # Immediate-Or-Cancel for faster execution
+                    order.outsideRth = True  # Allow after-hours execution
                     trade = self.ib.placeOrder(trade_contract, order)
-                    time.sleep(1)
+                    
+                    # Wait up to 10 seconds for fill
+                    for _ in range(10):
+                        time.sleep(1)
+                        if trade.orderStatus.status == 'Filled':
+                            break
                     
                     if trade.orderStatus.status == 'Filled':
                         entry_price = position['entry_price']
                         exit_price = trade.orderStatus.avgFillPrice
                         pnl = (exit_price - entry_price) * position['quantity']
                         pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                        
+                        # DATABASE COORDINATION: Remove from active positions
+                        self.db.remove_active_position(
+                            symbol=symbol,
+                            exit_price=exit_price,
+                            exit_reason='EOD_LIQUIDATION',
+                            agent_name='day_trader'
+                        )
+                        
+                        # DATABASE: Log liquidation trade
+                        self.db.log_trade({
+                            'symbol': symbol,
+                            'action': 'SELL',
+                            'quantity': position['quantity'],
+                            'price': exit_price,
+                            'agent_name': 'day_trader',
+                            'reason': 'End-of-day liquidation',
+                            'profit_loss': pnl,
+                            'profit_loss_pct': pnl_pct
+                        })
+                        
                         self.log(logging.INFO, f"LIQUIDATED {symbol}: Sold {position['quantity']} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
                         del self.positions[symbol]
                     else:
@@ -1543,6 +2277,16 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     
                     try:
                         trade_contract = Stock(symbol, 'SMART', 'USD')
+                        # Get current price
+                        bars = self.ib.reqHistoricalData(
+                            trade_contract, endDateTime='', durationStr='1 D',
+                            barSizeSetting='1 min', whatToShow='TRADES', useRTH=True
+                        )
+                        if bars:
+                            current_price = bars[-1].close
+                        else:
+                            current_price = pos.avgCost  # Fallback
+                        
                         order = MarketOrder('SELL', int(abs(pos.position)))
                         trade = self.ib.placeOrder(trade_contract, order)
                         time.sleep(1)
@@ -1551,6 +2295,27 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             exit_price = trade.orderStatus.avgFillPrice
                             pnl = (exit_price - pos.avgCost) * abs(pos.position)
                             pnl_pct = ((exit_price - pos.avgCost) / pos.avgCost) * 100
+                            
+                            # DATABASE COORDINATION: Remove untracked position
+                            self.db.remove_active_position(
+                                symbol=symbol,
+                                exit_price=exit_price,
+                                exit_reason='EOD_LIQUIDATION_UNTRACKED',
+                                agent_name='day_trader'
+                            )
+                            
+                            # DATABASE: Log untracked liquidation
+                            self.db.log_trade({
+                                'symbol': symbol,
+                                'action': 'SELL',
+                                'quantity': int(abs(pos.position)),
+                                'price': exit_price,
+                                'agent_name': 'day_trader',
+                                'reason': 'End-of-day liquidation (untracked position)',
+                                'profit_loss': pnl,
+                                'profit_loss_pct': pnl_pct
+                            })
+                            
                             self.log(logging.INFO, f"LIQUIDATED UNTRACKED {symbol}: Sold {abs(pos.position)} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
                         else:
                             self.log(logging.WARNING, f"Liquidation order for untracked {symbol} not filled. Status: {trade.orderStatus.status}")
@@ -1572,14 +2337,47 @@ class IntradayTraderAgent(BaseDayTraderAgent):
     def run(self):
         """
         The main execution method for the IntradayTraderAgent.
+        Enhanced with MOO (Market-On-Open) pre-market phase.
+        
+        Timeline:
+        - 9:20-9:27 AM ET: Place MOO orders (if watchlist ready)
+        - 9:30 AM ET: Monitor MOO fills, place profit targets
+        - 9:30 AM - 3:45 PM ET: Regular trading loop + position monitoring
+        - 3:45 PM ET: Liquidate all positions
         """
+        import pytz
+        from datetime import datetime, time as dt_time
+        
         try:
             self._connect_to_brokerage()
             self._load_watchlist()
             self._calculate_capital()
             self._sync_positions_from_ibkr()  # CRITICAL: Sync existing positions before trading
 
-            # Main trading window logic
+            # Get ET timezone
+            et_tz = pytz.timezone('US/Eastern')
+            
+            # MOO timing windows
+            moo_start_time = dt_time(9, 20)  # 9:20 AM ET
+            moo_end_time = dt_time(9, 27)    # 9:27 AM ET (1 min buffer before cutoff)
+            moo_fill_time = dt_time(9, 30)   # 9:30 AM ET (market open)
+            moo_fill_end = dt_time(9, 30, 30)  # 30 seconds after open
+            
+            # Check if we're in MOO placement window
+            now_et = datetime.now(et_tz)
+            current_time = now_et.time()
+            
+            # Phase 1: MOO Placement (9:20-9:27 AM ET)
+            if moo_start_time <= current_time < moo_end_time and not self.moo_placed:
+                self.log(logging.INFO, "⏰ MOO PLACEMENT WINDOW - Placing pre-market orders")
+                self._place_moo_orders()
+            
+            # Phase 2: MOO Fill Monitoring (9:30:00-9:30:30 AM ET)
+            elif moo_fill_time <= current_time < moo_fill_end and self.moo_placed and not self.moo_monitored:
+                self.log(logging.INFO, "⏰ MARKET OPENED - Monitoring MOO fills")
+                self._monitor_moo_fills()
+            
+            # Phase 3: Regular Trading Loop (9:30 AM - 4:00 PM ET)
             if is_market_open():
                 self._run_trading_loop()
             else:

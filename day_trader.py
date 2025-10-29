@@ -1,13 +1,15 @@
 """
 Main entry point for the Day-Trading Bot.
 
-This bot operates in SIX phases (enhanced October 22, 2025):
-0. Data Aggregation (7:00 AM): Collect fresh market data with ATR pre-filtering
-0.5. ATR Prediction (7:15 AM): LLM predicts today's volatility based on morning news
-1. Pre-Market Analysis (7:30 AM): Deep LLM analysis of top volatile candidates
+This bot operates in FIVE phases (optimized October 23, 2025):
+0. Data Aggregation (7:00 AM): Collect fresh market data with ATR > 1.0% filter
+1. Pre-Market Analysis (7:30 AM): Deep LLM analysis of volatile candidates
 1.5. Ticker Validation (8:15 AM): Verify IBKR can trade these stocks
 1.75. Pre-Market Momentum (9:00 AM): Analyze which stocks are moving in pre-market
 2. Intraday Trading (9:30 AM-4:00 PM): High-speed algorithmic trading
+
+REMOVED Phase 0.5 (ATR Prediction): Was too slow - DeepSeek calls for 27 stocks took forever.
+Data aggregator already filters by ATR > 1.0%, so LLM prediction was redundant.
 """
 
 import argparse
@@ -27,9 +29,8 @@ from day_trading_agents import (
     IntradayTraderAgent
 )
 from utils import setup_logging, is_market_open
-from tracing_setup import TradingBotTracer, TracedOperation
-from performance_tracker import PerformanceTracker
-from daily_analyzer import DailyPerformanceAnalyzer
+from observability import get_tracer, get_database
+# Removed deprecated imports - using observability module now
 
 class DayTraderOrchestrator:
     def __init__(self, allocation, paper_trade=True):
@@ -40,13 +41,12 @@ class DayTraderOrchestrator:
         self.paper_trade = paper_trade
         self.log_adapter = logging.LoggerAdapter(self.logger, {'agent': 'Orchestrator'})
         
-        # Initialize tracing and performance tracking
-        self.tracer_instance = TradingBotTracer(service_name="day-trading-bot")
-        self.tracer = self.tracer_instance.get_tracer()
-        self.performance_tracker = PerformanceTracker()
+        # Initialize observability (tracing handled by agents)
+        self.database = get_database()
+        self.tracer = get_tracer()
         
         self.log(logging.INFO, f"Day Trader Orchestrator initialized with {self.allocation*100}% capital allocation.")
-        self.log(logging.INFO, "[OK] Performance tracking and tracing enabled")
+        self.log(logging.INFO, "[OK] Observability system enabled")
 
     def log(self, level, message, **kwargs):
         self.log_adapter.log(level, message, **kwargs)
@@ -56,30 +56,23 @@ class DayTraderOrchestrator:
         Phase 0: Collect fresh market data if needed.
         Skips if data file is already current for today.
         """
-        with TracedOperation(self.tracer_instance, "Phase0_DataAggregation") as span:
-            self.log(logging.INFO, "Starting Phase 0: Data Aggregation.")
-            span.set_attribute("phase", "0_data_aggregation")
-            span.set_attribute("allocation", self.allocation)
-            
-            aggregator_agent = DataAggregatorAgent(self)
-            aggregator_agent.run()
-            
-            span.add_event("Data aggregation completed")
+        self.log(logging.INFO, "Starting Phase 0: Data Aggregation.")
+        
+        aggregator_agent = DataAggregatorAgent(self)
+        aggregator_agent.run()
+        
         self.log(logging.INFO, "Data Aggregation complete.")
 
     def run_pre_market_analysis(self):
         """
         Phase 1: Run the LLM-based agent to generate the watchlist.
         """
-        with TracedOperation(self.tracer_instance, "Phase1_PreMarketAnalysis") as span:
-            self.log(logging.INFO, "Starting Phase 1: Pre-Market Analysis.")
-            span.set_attribute("phase", "1_pre_market_analysis")
-            
-            watchlist_agent = WatchlistAnalystAgent(self)
-            watchlist_agent.run()
-            
-            span.add_event("Pre-market analysis completed")
-            self.log(logging.INFO, "Pre-Market Analysis complete. Watchlist generated.")
+        self.log(logging.INFO, "Starting Phase 1: Pre-Market Analysis.")
+        
+        watchlist_agent = WatchlistAnalystAgent(self)
+        watchlist_agent.run()
+        
+        self.log(logging.INFO, "Pre-Market Analysis complete. Watchlist generated.")
 
     def _run_atr_prediction(self):
         """Helper method to run ATR prediction."""
@@ -100,6 +93,35 @@ class DayTraderOrchestrator:
         except Exception as e:
             self.log(logging.ERROR, f"ATR Prediction failed: {e}. Proceeding with all stocks.")
             return market_data
+    
+    def _run_ticker_screener(self):
+        """Run the ticker screener to refresh the universe of stocks daily."""
+        try:
+            import subprocess
+            
+            # Check if us_tickers.json exists and is from today
+            if os.path.exists('us_tickers.json'):
+                file_mod_time = datetime.fromtimestamp(os.path.getmtime('us_tickers.json'))
+                if file_mod_time.date() == datetime.now().date():
+                    with open('us_tickers.json', 'r') as f:
+                        tickers = json.load(f)
+                    self.log(logging.INFO, f"Ticker universe is fresh for today with {len(tickers)} tickers. Skipping screener.")
+                    return
+            
+            # Run the ticker screener
+            self.log(logging.INFO, "Running ticker screener to refresh stock universe...")
+            result = subprocess.run(['python', 'ticker_screener_fmp.py'], 
+                                  capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0:
+                with open('us_tickers.json', 'r') as f:
+                    tickers = json.load(f)
+                self.log(logging.INFO, f"Ticker screener complete. {len(tickers)} tickers loaded.")
+            else:
+                self.log(logging.ERROR, f"Ticker screener failed: {result.stderr}")
+                
+        except Exception as e:
+            self.log(logging.ERROR, f"Failed to run ticker screener: {e}")
     
     def _run_ticker_validation(self):
         """Helper method to run ticker validation."""
@@ -126,16 +148,12 @@ class DayTraderOrchestrator:
         """
         Phase 2: Run the high-speed algorithmic trading agent.
         """
-        with TracedOperation(self.tracer_instance, "Phase2_IntradayTrading") as span:
-            self.log(logging.INFO, "Starting Phase 2: Intraday Trading.")
-            span.set_attribute("phase", "2_intraday_trading")
-            span.set_attribute("paper_trade", self.paper_trade)
-            
-            trader_agent = IntradayTraderAgent(self, self.allocation, self.paper_trade)
-            trader_agent.run()
-            
-            span.add_event("Intraday trading completed")
-            self.log(logging.INFO, "Intraday Trading complete. All positions liquidated.")
+        self.log(logging.INFO, "Starting Phase 2: Intraday Trading.")
+        
+        trader_agent = IntradayTraderAgent(self, self.allocation, self.paper_trade)
+        trader_agent.run()
+        
+        self.log(logging.INFO, "Intraday Trading complete. All positions liquidated.")
 
     def start(self):
         """
@@ -205,31 +223,21 @@ class DayTraderOrchestrator:
             # Between 7:00 AM and 4:00 PM - start immediately
             self.log(logging.INFO, f"[READY] Current time: {now_et.strftime('%I:%M:%S %p ET')} - starting immediately!")
 
+        # --- Phase -1: Ticker Screening (runs before Phase 0) ---
+        self.log(logging.INFO, "=" * 60)
+        self.log(logging.INFO, "PHASE -1: Ticker Universe Refresh (6:55 AM)")
+        self.log(logging.INFO, "=" * 60)
+        self._run_ticker_screener()
+
         # --- Phase 0: Data Aggregation (7:00 AM - with ATR filtering) ---
         self.log(logging.INFO, "=" * 60)
         self.log(logging.INFO, "PHASE 0: Data Collection (7:00 AM)")
         self.log(logging.INFO, "=" * 60)
         self.run_data_aggregation()
 
-        # --- Phase 0.5: ATR Prediction (7:15 AM) ---
-        self.log(logging.INFO, "=" * 60)
-        self.log(logging.INFO, "PHASE 0.5: ATR Prediction (7:15 AM)")
-        self.log(logging.INFO, "=" * 60)
-        
-        # Check if predictions already exist and are fresh for today
-        predictions_path = 'atr_predictions.json'
-        if os.path.exists(predictions_path):
-            pred_mtime = datetime.fromtimestamp(os.path.getmtime(predictions_path))
-            if pred_mtime.date() == datetime.now().date():
-                self.log(logging.INFO, f"ATR predictions already up-to-date for today. Skipping Phase 0.5.")
-                with open(predictions_path, 'r') as f:
-                    predicted_stocks = json.load(f)
-            else:
-                # Predictions are old, regenerate
-                predicted_stocks = self._run_atr_prediction()
-        else:
-            # No predictions file, run prediction
-            predicted_stocks = self._run_atr_prediction()
+        # Phase 0.5 is REMOVED - ATR prediction is redundant since data aggregator
+        # already filters by ATR > 1.0%. LLM prediction was too slow (27 stocks * DeepSeek calls)
+        # and didn't add enough value to justify the time cost.
 
         # --- Phase 1: Pre-Market Analysis (7:30 AM) ---
         self.log(logging.INFO, "=" * 60)
@@ -242,14 +250,24 @@ class DayTraderOrchestrator:
         self.log(logging.INFO, "PHASE 1.5: Ticker Validation (8:15 AM)")
         self.log(logging.INFO, "=" * 60)
         
-        # Check if validation already done today
+        # Check if validation already done today AND is complete
         validated_path = 'validated_tickers.json'
         if os.path.exists(validated_path):
             val_mtime = datetime.fromtimestamp(os.path.getmtime(validated_path))
             if val_mtime.date() == datetime.now().date():
-                self.log(logging.INFO, f"Ticker validation already up-to-date for today. Skipping Phase 1.5.")
-                with open(validated_path, 'r') as f:
-                    validated_tickers = json.load(f)
+                try:
+                    with open(validated_path, 'r') as f:
+                        validated_tickers = json.load(f)
+                    # Validation is fresh and has data
+                    if len(validated_tickers) > 0:
+                        self.log(logging.INFO, f"Ticker validation fresh for today with {len(validated_tickers)} tickers. Using cached validation.")
+                    else:
+                        # Empty validation, re-run
+                        self.log(logging.INFO, "Validation file is empty. Re-running validation.")
+                        validated_tickers = self._run_ticker_validation()
+                except:
+                    # Corrupted file, re-run
+                    validated_tickers = self._run_ticker_validation()
             else:
                 # Validation is old, re-run
                 validated_tickers = self._run_ticker_validation()
@@ -257,36 +275,139 @@ class DayTraderOrchestrator:
             # No validation file, run validation
             validated_tickers = self._run_ticker_validation()
         
-        # --- Phase 1.75: Pre-Market Momentum (9:00 AM) ---
+        # Check if we have any tradeable tickers
+        if not validated_tickers or len(validated_tickers) == 0:
+            self.log(logging.ERROR, "CRITICAL: No tickers passed validation. Cannot proceed with trading.")
+            self.log(logging.ERROR, "This usually means:")
+            self.log(logging.ERROR, "  1. IBKR connection issue")
+            self.log(logging.ERROR, "  2. Tickers not available for trading")
+            self.log(logging.ERROR, "  3. Data subscription issue with IBKR")
+            self.log(logging.ERROR, "Stopping bot to prevent trading invalid contracts.")
+            return
+        
+        self.log(logging.INFO, f"Validation successful: {len(validated_tickers)} tickers ready for trading.")
+        
+        # --- Phase 1.75: Dynamic Pre-Market Momentum + MOO Management ---
         self.log(logging.INFO, "=" * 60)
-        self.log(logging.INFO, "PHASE 1.75: Pre-Market Momentum Analysis (9:00 AM)")
+        self.log(logging.INFO, "PHASE 1.75: Dynamic Pre-Market Momentum + MOO Management")
         self.log(logging.INFO, "=" * 60)
         
-        # Wait until 9:00 AM if needed
-        now_et = datetime.now(et_tz)
-        premarket_check_time = dt_time(9, 0)
-        if now_et.time() < premarket_check_time:
-            wait_time = (et_tz.localize(datetime.combine(now_et.date(), premarket_check_time)) - now_et).total_seconds()
-            if wait_time > 0:
-                self.log(logging.INFO, f"Waiting {int(wait_time/60)} minutes until 9:00 AM for pre-market analysis...")
-                time.sleep(wait_time)
-        
-        try:
-            momentum_agent = PreMarketMomentumAgent(self)
-            ranked_tickers = momentum_agent.run(validated_tickers)
+        # CRITICAL: Skip MOO phase if market is already open (restart after 9:30 AM)
+        if is_market_open():
+            self.log(logging.WARNING, "⚠️  Market is ALREADY OPEN - skipping MOO placement phase!")
+            self.log(logging.INFO, "Bot will proceed directly to intraday trading and sync existing positions.")
+            # Jump straight to Phase 2
+        else:
+            self.log(logging.INFO, "Strategy: Run momentum analysis NOW, then every 15 minutes until 9:22 AM")
+            self.log(logging.INFO, "MOO orders will be dynamically adjusted based on changing pre-market momentum")
             
-            # Save ranked tickers
-            with open('ranked_tickers.json', 'w') as f:
-                json.dump(ranked_tickers, f, indent=2)
+            # Initialize intraday agent once (reuse for all MOO operations)
+            from day_trading_agents import IntradayTraderAgent
+            intraday_agent = IntradayTraderAgent(
+                orchestrator=self,
+                allocation=self.allocation,
+                paper_trade=self.paper_trade
+            )
+            intraday_agent._connect_to_brokerage()
             
-            self.log(logging.INFO, f"Pre-market momentum analysis complete. {len(ranked_tickers)} tickers ranked.")
+            # Dynamic momentum loop: Run now, then every 15 min until 9:22 AM
+            momentum_check_interval = 15 * 60  # 15 minutes in seconds
+            final_check_time = dt_time(9, 22)  # Last check at 9:22 AM (6 min before cutoff)
             
-        except Exception as e:
-            self.log(logging.ERROR, f"Pre-market momentum analysis failed: {e}. Using unranked list.")
-            ranked_tickers = validated_tickers
+            iteration = 0
+            while True:
+                iteration += 1
+                now_et = datetime.now(et_tz)
+                current_time = now_et.time()
+                
+                self.log(logging.INFO, f"\n--- Momentum Check #{iteration} at {now_et.strftime('%I:%M:%S %p ET')} ---")
+                
+                # Run momentum analysis
+                try:
+                    momentum_agent = PreMarketMomentumAgent(self)
+                    ranked_tickers = momentum_agent.run(validated_tickers)
+                    
+                    # Save ranked tickers
+                    with open('ranked_tickers.json', 'w') as f:
+                        json.dump(ranked_tickers, f, indent=2)
+                    
+                    self.log(logging.INFO, f"Momentum analysis complete. Top 5 stocks: {[t['ticker'] for t in ranked_tickers[:5]]}")
+                    
+                except Exception as e:
+                    self.log(logging.ERROR, f"Momentum analysis failed: {e}. Keeping previous rankings.")
+                    # Load previous rankings if they exist
+                    try:
+                        with open('ranked_tickers.json', 'r') as f:
+                            ranked_tickers = json.load(f)
+                    except:
+                        ranked_tickers = validated_tickers
+                
+                # Update MOO orders based on latest momentum
+                try:
+                    intraday_agent._load_watchlist()  # Reload with updated rankings
+                    intraday_agent._calculate_capital()
+                    
+                    # Get current order symbols
+                    current_symbols = [moo['symbol'] for moo in intraday_agent.moo_trades] if hasattr(intraday_agent, 'moo_trades') else []
+                    
+                    # Get new top stocks from updated rankings
+                    max_moo_orders = min(5, 4 - len(intraday_agent.positions))
+                    new_top_stocks = [item.get('ticker') for item in intraday_agent.watchlist_data[:max_moo_orders]]
+                    
+                    # Determine which orders to cancel (no longer in top rankings)
+                    to_cancel = [symbol for symbol in current_symbols if symbol not in new_top_stocks]
+                    to_keep = [symbol for symbol in current_symbols if symbol in new_top_stocks]
+                    to_add = [symbol for symbol in new_top_stocks if symbol not in current_symbols]
+                    
+                    if to_cancel:
+                        self.log(logging.INFO, f"Cancelling orders for stocks that dropped in rankings: {', '.join(to_cancel)}")
+                        for moo in intraday_agent.moo_trades[:]:  # Copy list to avoid modification during iteration
+                            if moo['symbol'] in to_cancel:
+                                intraday_agent.ib.cancelOrder(moo['trade'].order)
+                                intraday_agent.moo_trades.remove(moo)
+                    
+                    if to_keep:
+                        self.log(logging.INFO, f"Keeping orders for stocks still in top rankings: {', '.join(to_keep)}")
+                    
+                    if to_add:
+                        self.log(logging.INFO, f"Adding new orders for stocks that moved up: {', '.join(to_add)}")
+                        # Place new MOO orders (will only place for stocks not already ordered)
+                        intraday_agent._place_moo_orders()
+                    
+                    self.log(logging.INFO, f"MOO orders after update: {len(intraday_agent.moo_trades)} orders queued for 9:30 AM")
+                    
+                    # Log current order symbols
+                    if intraday_agent.moo_trades:
+                        symbols = [moo['symbol'] for moo in intraday_agent.moo_trades]
+                        self.log(logging.INFO, f"Current MOO orders: {', '.join(symbols)}")
+                    
+                except Exception as e:
+                    self.log(logging.ERROR, f"MOO order update failed: {e}")
+                
+                # Check if this was the final iteration
+                if current_time >= final_check_time:
+                    self.log(logging.INFO, f"\nFINAL momentum check complete at {now_et.strftime('%I:%M:%S %p ET')}")
+                    self.log(logging.INFO, f"MOO orders LOCKED. No more changes until 9:30 AM execution.")
+                    break
+                
+                # Calculate next check time
+                next_check = now_et + timedelta(seconds=momentum_check_interval)
+                
+                # If next check would be after 9:22 AM, schedule final check at 9:22 AM instead
+                if next_check.time() > final_check_time:
+                    next_check = et_tz.localize(datetime.combine(now_et.date(), final_check_time))
+                
+                wait_seconds = (next_check - now_et).total_seconds()
+                
+                if wait_seconds > 0:
+                    self.log(logging.INFO, f"Next momentum check at {next_check.strftime('%I:%M:%S %p ET')} ({int(wait_seconds/60)} minutes)")
+                    time.sleep(wait_seconds)
+
 
         # --- Phase 2: Intraday Trading ---
-        self.log(logging.INFO, "Checking market hours before starting Phase 2.")
+        self.log(logging.INFO, "=" * 60)
+        self.log(logging.INFO, "PHASE 2: Intraday Trading (9:30 AM - 3:45 PM)")
+        self.log(logging.INFO, "=" * 60)
         
         # Wait for the market to open if it's not already.
         # This loop will run once and exit if the market is open.
@@ -299,11 +420,7 @@ class DayTraderOrchestrator:
         self.log(logging.INFO, "Market is open. Proceeding with intraday trading.")
         self.run_intraday_trading()
         
-        # Analyze daily performance
-        self.log(logging.INFO, "Analyzing today's performance...")
-        analyzer = DailyPerformanceAnalyzer(self.log_file, self.performance_tracker)
-        analyzer.analyze_day()
-        
+        # Performance analysis is handled by autonomous system (continuous_improvement.py)
         self.log(logging.INFO, "Day trading bot workflow finished.")
 
     def run_backtest(self, target_date: str):
@@ -434,9 +551,9 @@ class DayTraderOrchestrator:
                 pred = next((p for p in predictions if p['ticker'] == ticker), None)
                 predicted_atr = pred['predicted_atr'] if pred else 0.0
                 
-                # Check if would have hit profit target (+1.4%) or stop loss (-0.8%)
-                hit_profit = intraday_high_pct >= 1.4
-                hit_stop = intraday_low_pct <= -0.8
+                # Check if would have hit profit target (+1.8%) or stop loss (-0.9%)
+                hit_profit = intraday_high_pct >= 1.8
+                hit_stop = intraday_low_pct <= -0.9
                 
                 result = {
                     'ticker': ticker,
@@ -453,7 +570,7 @@ class DayTraderOrchestrator:
                 results.append(result)
                 
                 # Log result
-                status = "✅ PROFIT" if hit_profit else ("❌ STOP" if hit_stop else "🟡 HOLD")
+                status = "PROFIT" if hit_profit else ("STOP" if hit_stop else "HOLD")
                 self.log(logging.INFO,
                         f"{ticker}: {status} | "
                         f"High: +{intraday_high_pct:.2f}%, Low: {intraday_low_pct:.2f}%, "
@@ -484,8 +601,8 @@ class DayTraderOrchestrator:
             accuracy = max(0, 100 - (avg_error / avg_pred_atr * 100)) if avg_pred_atr > 0 else 0
             
             self.log(logging.INFO, f"Total Tickers Analyzed: {total}")
-            self.log(logging.INFO, f"Hit Profit Target (+1.4%): {winners} ({win_rate:.1f}%)")
-            self.log(logging.INFO, f"Hit Stop Loss (-0.8%): {losers}")
+            self.log(logging.INFO, f"Hit Profit Target (+1.8%): {winners} ({win_rate:.1f}%)")
+            self.log(logging.INFO, f"Hit Stop Loss (-0.9%): {losers}")
             self.log(logging.INFO, f"Still Holding: {holds}")
             self.log(logging.INFO, f"Average Actual ATR: {avg_atr:.2f}%")
             self.log(logging.INFO, f"Average Predicted ATR: {avg_pred_atr:.2f}%")

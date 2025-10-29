@@ -154,6 +154,38 @@ class TradingDatabase:
                 )
             """)
             
+            # Active positions table (shared state between bots)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS active_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL UNIQUE,
+                    quantity REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    entry_timestamp TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    profit_target_price REAL,
+                    stop_loss_price REAL,
+                    status TEXT DEFAULT 'OPEN',
+                    last_updated TEXT NOT NULL,
+                    metadata TEXT
+                )
+            """)
+            
+            # Closed positions today (re-entry prevention)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS closed_positions_today (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    close_date TEXT NOT NULL,
+                    exit_price REAL NOT NULL,
+                    exit_reason TEXT NOT NULL,
+                    profit_loss_pct REAL,
+                    agent_name TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    UNIQUE(symbol, close_date)
+                )
+            """)
+            
             conn.commit()
     
     @contextmanager
@@ -360,6 +392,124 @@ class TradingDatabase:
                     ORDER BY date
                 """, (start_date, end_date))
             return [dict(row) for row in cursor.fetchall()]
+    
+    # === SHARED STATE MANAGEMENT (Bot Coordination) ===
+    
+    def add_active_position(self, symbol: str, quantity: float, entry_price: float, 
+                           agent_name: str, profit_target: float, stop_loss: float,
+                           metadata: Dict = None) -> bool:
+        """Add or update an active position (shared state)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO active_positions (
+                        symbol, quantity, entry_price, entry_timestamp,
+                        agent_name, profit_target_price, stop_loss_price,
+                        status, last_updated, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """, (symbol, quantity, entry_price, now, agent_name,
+                      profit_target, stop_loss, now, json.dumps(metadata or {})))
+                conn.commit()
+                logger.info(f"Added active position: {symbol}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to add position {symbol}: {e}")
+                return False
+    
+    def remove_active_position(self, symbol: str, exit_price: float, 
+                              exit_reason: str, agent_name: str) -> bool:
+        """Remove active position and add to closed_today (prevents re-entry)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.now(timezone.utc).isoformat()
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            
+            try:
+                # Get position info
+                cursor.execute("""
+                    SELECT entry_price, quantity FROM active_positions WHERE symbol = ?
+                """, (symbol,))
+                row = cursor.fetchone()
+                
+                if row:
+                    entry_price = row['entry_price']
+                    quantity = row['quantity']
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    
+                    # Add to closed_today
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO closed_positions_today (
+                            symbol, close_date, exit_price, exit_reason,
+                            profit_loss_pct, agent_name, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (symbol, today, exit_price, exit_reason, pnl_pct, agent_name, now))
+                
+                # Remove from active
+                cursor.execute("DELETE FROM active_positions WHERE symbol = ?", (symbol,))
+                conn.commit()
+                logger.info(f"Removed position: {symbol} ({exit_reason})")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to remove position {symbol}: {e}")
+                return False
+    
+    def is_position_active(self, symbol: str) -> bool:
+        """Check if symbol has an active position"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM active_positions 
+                WHERE symbol = ? AND status = 'OPEN'
+            """, (symbol,))
+            return cursor.fetchone()['count'] > 0
+    
+    def was_closed_today(self, symbol: str) -> bool:
+        """Check if symbol was closed today (prevents re-entry)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM closed_positions_today 
+                WHERE symbol = ? AND close_date = ?
+            """, (symbol, today))
+            return cursor.fetchone()['count'] > 0
+    
+    def get_active_positions(self) -> List[Dict]:
+        """Get all active positions"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM active_positions WHERE status = 'OPEN'
+                ORDER BY entry_timestamp DESC
+            """, ())
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_closed_today(self) -> List[Dict]:
+        """Get all positions closed today"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            cursor.execute("""
+                SELECT * FROM closed_positions_today 
+                WHERE close_date = ?
+                ORDER BY timestamp DESC
+            """, (today,))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def clear_closed_today(self) -> bool:
+        """Clear closed_today table (call at start of new trading day)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("DELETE FROM closed_positions_today")
+                conn.commit()
+                logger.info("Cleared closed_today table for new trading day")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to clear closed_today: {e}")
+                return False
 
 
 class TradingTracer:
