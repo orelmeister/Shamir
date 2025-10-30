@@ -128,8 +128,10 @@ class IntradayScanner:
         
         logger.info(f"💾 Saved {len(watchlist)} fresh stocks to day_trading_watchlist.json")
         
-        # Also save detailed version
-        with open(f'intraday_scan_{timestamp}.json', 'w') as f:
+        # Also save detailed version to designated folder
+        import os
+        os.makedirs("intraday_scans", exist_ok=True)
+        with open(f'intraday_scans/intraday_scan_{timestamp}.json', 'w') as f:
             json.dump(movers, f, indent=4)
         
         return watchlist
