@@ -152,6 +152,32 @@ class BotSupervisor:
         last_status = time.time()
         
         try:
+            # Initial startup check
+            now = datetime.now()
+            should_be_awake = self.should_be_awake()
+            
+            if should_be_awake:
+                # Start bots immediately on startup if within trading hours
+                print(f"\n✅ Within trading hours ({now.strftime('%H:%M:%S')}). Starting bots...")
+                print("="*80)
+                
+                if not self.start_exit_manager():
+                    print("❌ Failed to start Exit Manager")
+                    return
+                
+                time.sleep(5)
+                
+                if not self.start_day_trader():
+                    print("⚠️  Failed to start Day Trader. Continuing with Exit Manager only.")
+                
+                self.sleeping = False
+                print("✅ Bots started successfully\n")
+            else:
+                # Outside trading hours on startup
+                print(f"\n💤 Outside trading hours ({now.strftime('%H:%M:%S')}). Sleeping...")
+                print(f"Will auto-wake at {self.WAKE_HOUR}:00 AM PT\n")
+                self.sleeping = True
+            
             while self.running:
                 now = datetime.now()
                 should_be_awake = self.should_be_awake()
