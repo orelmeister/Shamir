@@ -1258,9 +1258,9 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     sl_order.outsideRth = False
                     
                     tp_trade = self.ib.placeOrder(contract, tp_order)
-                    self.ib.sleep(0.5)  # Wait for order to be accepted
+                    self.ib.sleep(1)  # Wait for order to be accepted
                     sl_trade = self.ib.placeOrder(contract, sl_order)
-                    self.ib.sleep(1)  # Wait for both orders to be transmitted
+                    self.ib.sleep(3)  # Wait for both orders to be transmitted (IBKR needs time!)
                     
                     # Verify orders were accepted
                     tp_status = tp_trade.orderStatus.status
@@ -1763,9 +1763,9 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             
                             try:
                                 tp_trade = self.ib.placeOrder(contract, tp_order)
-                                self.ib.sleep(0.5)  # Wait for order to be accepted
+                                self.ib.sleep(1)  # Wait for order to be accepted
                                 sl_trade = self.ib.placeOrder(contract, sl_order)
-                                self.ib.sleep(1)  # Wait for both orders to be transmitted
+                                self.ib.sleep(3)  # Wait for both orders to be transmitted (IBKR needs time!)
                                 
                                 # Verify orders were accepted
                                 tp_status = tp_trade.orderStatus.status
