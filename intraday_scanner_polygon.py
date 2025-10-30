@@ -229,9 +229,11 @@ class PolygonIntradayScanner:
         
         logger.info(f"✅ Saved {len(formatted_watchlist)} stocks to day_trading_watchlist.json")
         
-        # Save detailed backup
+        # Save detailed backup to designated folder
+        import os
+        os.makedirs("intraday_scans", exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-        backup_file = f"intraday_scan_polygon_{timestamp}.json"
+        backup_file = f"intraday_scans/intraday_scan_polygon_{timestamp}.json"
         with open(backup_file, 'w') as f:
             json.dump(movers, f, indent=2)
         
