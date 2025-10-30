@@ -1030,7 +1030,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
     market hours based on technical indicators. It does NOT use an LLM for
     real-time decisions.
     """
-    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.018, stop_loss_pct=0.009):
+    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.026, stop_loss_pct=0.013):
         super().__init__(orchestrator, "IntradayTraderAgent")
         self.allocation = allocation
         self.paper_trade = paper_trade
