@@ -1722,13 +1722,50 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         filled_quantity = trade.orderStatus.filled
                         
                         if pending_info['action'] == 'BUY':
+                            self.log(logging.INFO, f"PENDING BUY FILLED: {filled_quantity} shares of {symbol} at ${fill_price:.2f}")
+                            
+                            # Calculate OCO bracket prices based on ACTUAL fill price
+                            take_profit_price = fill_price * (1 + self.profit_target_pct)
+                            stop_loss_price = fill_price * (1 - self.stop_loss_pct)
+                            
+                            # Create OCA (One-Cancels-All) group for OCO bracket
+                            oca_group = f"OCA_{symbol}_{int(time.time())}"
+                            
+                            # Place OCO bracket: Take Profit (LIMIT) + Stop Loss (STOP)
+                            contract = pending_info['contract']
+                            
+                            tp_order = LimitOrder('SELL', filled_quantity, take_profit_price)
+                            tp_order.ocaGroup = oca_group
+                            tp_order.ocaType = 1  # Cancel remaining on fill
+                            tp_order.tif = 'DAY'
+                            tp_order.outsideRth = False
+                            
+                            sl_order = StopOrder('SELL', filled_quantity, stop_loss_price)
+                            sl_order.ocaGroup = oca_group
+                            sl_order.ocaType = 1  # Cancel remaining on fill
+                            sl_order.tif = 'DAY'
+                            sl_order.outsideRth = False
+                            
+                            tp_trade = self.ib.placeOrder(contract, tp_order)
+                            sl_trade = self.ib.placeOrder(contract, sl_order)
+                            
+                            self.log(logging.INFO, f"OCO Bracket placed: TP @ ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                            self.log(logging.INFO, f"OCA Group: {oca_group}")
+                            
+                            # Store position with OCO bracket references
                             self.positions[symbol] = {
                                 "quantity": filled_quantity,
                                 "entry_price": fill_price,
-                                "contract": pending_info['contract'],
-                                "atr_pct": pending_info.get('atr_pct')
+                                "contract": contract,
+                                "atr_pct": pending_info.get('atr_pct'),
+                                "take_profit_trade": tp_trade,
+                                "stop_loss_trade": sl_trade,
+                                "take_profit_price": take_profit_price,
+                                "stop_loss_price": stop_loss_price,
+                                "oca_group": oca_group,
+                                "entry_type": "SCANNER",
+                                "entry_time": time.time()
                             }
-                            self.log(logging.INFO, f"PENDING BUY FILLED: {filled_quantity} shares of {symbol} at ${fill_price:.2f}")
                             
                             # Log to database
                             capital = float(self.account_summary.get('NetLiquidation', 0))
@@ -1745,7 +1782,9 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                     'vwap': 0,
                                     'rsi': 0,
                                     'atr_pct': pending_info.get('atr_pct', 0),
-                                    'current_price': fill_price
+                                    'current_price': fill_price,
+                                    'take_profit': take_profit_price,
+                                    'stop_loss': stop_loss_price
                                 }
                             })
                         
