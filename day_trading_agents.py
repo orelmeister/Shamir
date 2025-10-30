@@ -1325,13 +1325,28 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.log(logging.WARNING, "Already at max positions, skipping MOO orders")
             return
         
-        # Select top stocks
-        top_stocks = self.watchlist_data[:max_moo_orders]
-        self.log(logging.INFO, f"Selected {len(top_stocks)} stocks for MOO orders:")
+        # Select top stocks - FILTER OUT NEGATIVE PRE-MARKET MOVEMENT
+        top_stocks = []
+        for item in self.watchlist_data:
+            if len(top_stocks) >= max_moo_orders:
+                break
+            
+            symbol = item.get('ticker')
+            premarket_change = item.get('premarket_change', 0)  # Default to 0 if missing
+            
+            # Accept stocks with >= -1.0% pre-market change (positive or small dip only)
+            if premarket_change >= -1.0:
+                top_stocks.append(item)
+            else:
+                # Log rejected stocks for visibility
+                self.log(logging.INFO, f"❌ REJECTED {symbol}: Pre-market {premarket_change:+.2f}% (too negative)")
+        
+        self.log(logging.INFO, f"Selected {len(top_stocks)} stocks for MOO orders (after pre-market filter):")
         for item in top_stocks:
             symbol = item.get('ticker')
             confidence = item.get('confidence_score', 0)
-            self.log(logging.INFO, f"  • {symbol} ({confidence:.0f}% confidence)")
+            premarket_change = item.get('premarket_change', 0)
+            self.log(logging.INFO, f"  ✅ {symbol} ({confidence:.0f}% confidence, pre-market {premarket_change:+.2f}%)")
         
         # Place MOO orders
         for item in top_stocks:
