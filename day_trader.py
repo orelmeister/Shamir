@@ -353,20 +353,20 @@ class DayTraderOrchestrator:
                     # Get new top stocks from updated rankings - FILTER OUT NEGATIVE PRE-MARKET MOVEMENT
                     max_moo_orders = min(5, 4 - len(intraday_agent.positions))
                     
-                    # Filter: Only stocks with NON-NEGATIVE pre-market movement (>= -1.0% to allow small dips)
+                    # Filter: Only stocks with POSITIVE pre-market movement (>= 0%)
                     filtered_stocks = []
                     for item in intraday_agent.watchlist_data:
                         ticker = item.get('ticker')
                         premarket_change = item.get('premarket_change', 0)  # Default to 0 if missing
                         
-                        # Accept stocks with >= -1.0% pre-market change (positive or small dip only)
-                        if premarket_change >= -1.0:
+                        # Accept stocks with >= 0% pre-market change (positive momentum only)
+                        if premarket_change >= 0:
                             filtered_stocks.append(ticker)
                             if len(filtered_stocks) >= max_moo_orders:
                                 break
                         else:
                             # Log rejected stocks for visibility
-                            self.log(logging.INFO, f"REJECTED {ticker}: Pre-market {premarket_change:+.2f}% (too negative)")
+                            self.log(logging.INFO, f"REJECTED {ticker}: Pre-market {premarket_change:+.2f}% (negative momentum)")
                     
                     new_top_stocks = filtered_stocks
                     

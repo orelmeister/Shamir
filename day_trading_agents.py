@@ -1334,12 +1334,12 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             symbol = item.get('ticker')
             premarket_change = item.get('premarket_change', 0)  # Default to 0 if missing
             
-            # Accept stocks with >= -1.0% pre-market change (positive or small dip only)
-            if premarket_change >= -1.0:
+            # Accept stocks with >= 0% pre-market change (positive momentum only)
+            if premarket_change >= 0:
                 top_stocks.append(item)
             else:
                 # Log rejected stocks for visibility
-                self.log(logging.INFO, f"❌ REJECTED {symbol}: Pre-market {premarket_change:+.2f}% (too negative)")
+                self.log(logging.INFO, f"❌ REJECTED {symbol}: Pre-market {premarket_change:+.2f}% (negative momentum)")
         
         self.log(logging.INFO, f"Selected {len(top_stocks)} stocks for MOO orders (after pre-market filter):")
         for item in top_stocks:
