@@ -1257,23 +1257,33 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     sl_order.tif = 'DAY'
                     sl_order.outsideRth = False
                     
-                    tp_trade = self.ib.placeOrder(contract, tp_order)
-                    self.ib.sleep(1)  # Wait for order to be accepted
-                    sl_trade = self.ib.placeOrder(contract, sl_order)
-                    self.ib.sleep(3)  # Wait for both orders to be transmitted (IBKR needs time!)
+                    # ============================================================
+                    # STEP 3: PLACE OCO BRACKET ORDERS FOR SYNCED POSITION
+                    # ============================================================
+                    self.log(logging.INFO, f"⏳ STEP 3: Placing OCO brackets for synced position {symbol}...")
                     
-                    # Verify orders were accepted
+                    tp_trade = self.ib.placeOrder(contract, tp_order)
+                    self.ib.sleep(1)  # Wait for TP to be accepted
+                    sl_trade = self.ib.placeOrder(contract, sl_order)
+                    self.ib.sleep(3)  # Wait for SL to be accepted
+                    
+                    # Verify OCO orders were accepted
                     tp_status = tp_trade.orderStatus.status
                     sl_status = sl_trade.orderStatus.status
                     
-                    self.log(logging.INFO, f"SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
-                    self.log(logging.INFO, f"   OCO Bracket: TP @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
-                    self.log(logging.INFO, f"   OCA Group: {oca_group}, TP Status: {tp_status}, SL Status: {sl_status}")
+                    self.log(logging.INFO, f"✅ SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
                     
-                    if tp_status in ['Inactive', 'PendingCancel', 'Cancelled']:
-                        self.log(logging.ERROR, f"TP order NOT accepted for {symbol}! Status: {tp_status}")
-                    if sl_status in ['Inactive', 'PendingCancel', 'Cancelled']:
-                        self.log(logging.ERROR, f"SL order NOT accepted for {symbol}! Status: {sl_status}")
+                    if tp_status in ['Submitted', 'PreSubmitted']:
+                        self.log(logging.INFO, f"   ✅ TP order accepted: ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%) [Status: {tp_status}]")
+                    else:
+                        self.log(logging.ERROR, f"   ❌ TP order FAILED! Status: {tp_status}")
+                    
+                    if sl_status in ['Submitted', 'PreSubmitted']:
+                        self.log(logging.INFO, f"   ✅ SL order accepted: ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%) [Status: {sl_status}]")
+                    else:
+                        self.log(logging.ERROR, f"   ❌ SL order FAILED! Status: {sl_status}")
+                    
+                    self.log(logging.INFO, f"   OCA Group: {oca_group}")
                     
                     # Create position entry in our tracking dictionary
                     self.positions[symbol] = {
@@ -1733,11 +1743,39 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     self.ib.sleep(0.1)
                     
                     if trade.orderStatus.status == 'Filled':
+                        # ============================================================
+                        # STEP 1: BUY ORDER FILL CONFIRMED (already done)
+                        # ============================================================
                         fill_price = trade.orderStatus.avgFillPrice
                         filled_quantity = trade.orderStatus.filled
                         
                         if pending_info['action'] == 'BUY':
-                            self.log(logging.INFO, f"PENDING BUY FILLED: {filled_quantity} shares of {symbol} at ${fill_price:.2f}")
+                            self.log(logging.INFO, f"✅ STEP 1 COMPLETE: PENDING BUY FILLED - {filled_quantity} shares of {symbol} at ${fill_price:.2f}")
+                            
+                            # ============================================================
+                            # STEP 2: VERIFY POSITION EXISTS IN IBKR
+                            # ============================================================
+                            self.log(logging.INFO, f"⏳ STEP 2: Verifying position exists in IBKR account...")
+                            self.ib.sleep(1)  # Give IBKR time to register the position
+                            
+                            # Refresh positions from IBKR
+                            ibkr_positions = self.ib.positions()
+                            position_found = False
+                            for pos in ibkr_positions:
+                                if pos.contract.symbol == symbol and pos.position == filled_quantity:
+                                    position_found = True
+                                    self.log(logging.INFO, f"✅ STEP 2 COMPLETE: Position verified in IBKR - {pos.position} shares @ ${pos.avgCost:.2f}")
+                                    break
+                            
+                            if not position_found:
+                                self.log(logging.ERROR, f"❌ STEP 2 FAILED: Position for {symbol} NOT found in IBKR! Cannot place OCO orders safely.")
+                                pending_to_remove.append(symbol)
+                                continue  # CRITICAL: Do not place OCO if position not confirmed
+                            
+                            # ============================================================
+                            # STEP 3: PLACE OCO BRACKET ORDERS (ONLY AFTER VERIFICATION)
+                            # ============================================================
+                            self.log(logging.INFO, f"⏳ STEP 3: Placing OCO bracket orders...")
                             
                             # Calculate OCO bracket prices based on ACTUAL fill price
                             take_profit_price = fill_price * (1 + self.profit_target_pct)
@@ -1763,24 +1801,28 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             
                             try:
                                 tp_trade = self.ib.placeOrder(contract, tp_order)
-                                self.ib.sleep(1)  # Wait for order to be accepted
+                                self.ib.sleep(1)  # Wait for TP to be accepted
                                 sl_trade = self.ib.placeOrder(contract, sl_order)
-                                self.ib.sleep(3)  # Wait for both orders to be transmitted (IBKR needs time!)
+                                self.ib.sleep(3)  # Wait for SL to be accepted
                                 
-                                # Verify orders were accepted
+                                # Verify OCO orders were accepted
                                 tp_status = tp_trade.orderStatus.status
                                 sl_status = sl_trade.orderStatus.status
                                 
-                                self.log(logging.INFO, f"OCO Bracket placed: TP @ ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
-                                self.log(logging.INFO, f"OCA Group: {oca_group}")
-                                self.log(logging.INFO, f"TP Order ID: {tp_trade.order.orderId} (Status: {tp_status}), SL Order ID: {sl_trade.order.orderId} (Status: {sl_status})")
+                                if tp_status in ['Submitted', 'PreSubmitted']:
+                                    self.log(logging.INFO, f"✅ TP order accepted: ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%) [Status: {tp_status}]")
+                                else:
+                                    self.log(logging.ERROR, f"❌ TP order FAILED! Status: {tp_status}")
                                 
-                                if tp_status in ['Inactive', 'PendingCancel', 'Cancelled']:
-                                    self.log(logging.ERROR, f"TP order NOT accepted! Status: {tp_status}")
-                                if sl_status in ['Inactive', 'PendingCancel', 'Cancelled']:
-                                    self.log(logging.ERROR, f"SL order NOT accepted! Status: {sl_status}")
+                                if sl_status in ['Submitted', 'PreSubmitted']:
+                                    self.log(logging.INFO, f"✅ SL order accepted: ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%) [Status: {sl_status}]")
+                                else:
+                                    self.log(logging.ERROR, f"❌ SL order FAILED! Status: {sl_status}")
+                                
+                                self.log(logging.INFO, f"✅ STEP 3 COMPLETE: OCO Bracket placed - OCA Group: {oca_group}")
+                                self.log(logging.INFO, f"   TP Order ID: {tp_trade.order.orderId}, SL Order ID: {sl_trade.order.orderId}")
                             except Exception as e:
-                                self.log(logging.ERROR, f"FAILED to place OCO brackets for {symbol}: {e}")
+                                self.log(logging.ERROR, f"❌ STEP 3 FAILED: Could not place OCO brackets for {symbol}: {e}")
                                 import traceback
                                 self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
                             
@@ -2071,118 +2113,139 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                             'stop_loss_price': stop_loss_price
                                         }
                                         
-                                        # Wait up to 3 seconds for BUY to fill
-                                        for _ in range(6):
-                                            time.sleep(0.5)
+                                        # ============================================================
+                                        # STEP 1: WAIT FOR BUY ORDER FILL CONFIRMATION
+                                        # ============================================================
+                                        self.log(logging.INFO, f"⏳ STEP 1: Waiting for BUY order fill confirmation...")
+                                        for attempt in range(10):  # Wait up to 5 seconds
+                                            self.ib.sleep(0.5)
                                             if parent_trade.orderStatus.status == 'Filled':
                                                 break
                                         
-                                        if parent_trade.orderStatus.status == 'Filled':
-                                            fill_price = parent_trade.orderStatus.avgFillPrice
-                                            filled_quantity = parent_trade.orderStatus.filled
-                                            
-                                            self.log(logging.INFO, f"BUY FILLED: {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
-                                            
-                                            # Step 2: NOW place OCO bracket orders AFTER BUY confirmed
-                                            # Recalculate based on ACTUAL fill price
-                                            actual_take_profit = fill_price * 1.026  # +2.6% from actual fill
-                                            actual_stop_loss = fill_price * 0.991    # -0.9% from actual fill
-                                            
-                                            # Create unique OCA (One-Cancels-All) group for this position
-                                            oca_group = f"OCA_{contract.symbol}_{int(time.time())}"
-                                            
-                                            # Take Profit order (LIMIT SELL)
-                                            take_profit_order = LimitOrder('SELL', filled_quantity, actual_take_profit)
-                                            take_profit_order.ocaGroup = oca_group
-                                            take_profit_order.ocaType = 1  # Cancel all when one fills
-                                            take_profit_order.tif = 'DAY'
-                                            take_profit_order.outsideRth = False
-                                            
-                                            # Stop Loss order (STOP SELL) - Now part of OCO bracket!
-                                            stop_loss_order = StopOrder('SELL', filled_quantity, actual_stop_loss)
-                                            stop_loss_order.ocaGroup = oca_group  # SAME group as take profit
-                                            stop_loss_order.ocaType = 1  # Cancel all when one fills
-                                            stop_loss_order.tif = 'DAY'
-                                            stop_loss_order.outsideRth = False
-                                            
-                                            # Place both OCO orders
-                                            tp_trade = self.ib.placeOrder(trade_contract, take_profit_order)
-                                            sl_trade = self.ib.placeOrder(trade_contract, stop_loss_order)
-                                            
-                                            self.log(logging.INFO, f"OCO Bracket placed: TP @ ${actual_take_profit:.2f} (+2.6%), SL @ ${actual_stop_loss:.2f} (-0.9%), OCA Group: {oca_group}")
-                                            
-                                            # Store position with OCO bracket references
-                                            self.positions[contract.symbol] = {
-                                                "quantity": filled_quantity,
-                                                "entry_price": fill_price,
-                                                "contract": contract,
-                                                "atr_pct": atr_pct,
-                                                "take_profit_trade": tp_trade,  # Reference to TP order
-                                                "stop_loss_trade": sl_trade,    # Reference to SL order (OCO)
-                                                "stop_loss_price": actual_stop_loss,
-                                                "take_profit_price": actual_take_profit,
-                                                "oca_group": oca_group  # Track OCO group
-                                            }
-                                            
-                                            # DATABASE COORDINATION: Register position in shared database
-                                            # This allows Exit Manager to see and manage this position
-                                            self.db.add_active_position(
-                                                symbol=contract.symbol,
-                                                quantity=filled_quantity,
-                                                entry_price=fill_price,
-                                                agent_name='day_trader',
-                                                profit_target=actual_take_profit,
-                                                stop_loss=actual_stop_loss
-                                            )
-                                            
-                                            # DATABASE: Log the entry trade
-                                            self.db.log_trade({
-                                                'symbol': contract.symbol,
-                                                'action': 'BUY',
-                                                'quantity': filled_quantity,
-                                                'price': fill_price,
-                                                'agent_name': 'day_trader',
-                                                'reason': entry_reason,
-                                                'metadata': {
-                                                    'rsi': rsi,
-                                                    'vwap': vwap,
-                                                    'atr_pct': atr_pct,
-                                                    'pre_market_gap': pre_market_gap,
-                                                    'take_profit': actual_take_profit,
-                                                    'stop_loss': actual_stop_loss
-                                                }
-                                            })
-                                            
-                                            self.log(logging.INFO, f"✅ Position registered in database: {contract.symbol} @ ${fill_price:.2f}")
-                                            
-                                            # Mark as recovery trade if re-entering after stop loss
-                                            if contract.symbol in self.sold_stocks and self.sold_stocks[contract.symbol].get('can_reenter'):
-                                                self.recovery_trades.add(contract.symbol)
-                                                self.log(logging.INFO, f"RECOVERY TRADE for {contract.symbol} - bracket orders active")
-                                            
-                                            # Remove from pending
-                                            del self.pending_orders[contract.symbol]
-                                            
-                                            # AUTONOMOUS: Log trade to database
-                                            capital = float(self.account_summary.get('NetLiquidation', 0))
-                                            self.db.log_trade({
-                                                'symbol': contract.symbol,
-                                                'action': 'BUY',
-                                                'quantity': filled_quantity,
-                                                'price': fill_price,
-                                                'agent_name': self.agent_name,
-                                                'reason': f'Entry signal: Price>${vwap:.2f} VWAP, RSI={rsi:.2f}<60, ATR={atr_pct:.2f}%',
-                                                'capital_at_trade': capital,
-                                                'position_size_pct': (filled_quantity * fill_price / capital * 100) if capital > 0 else 0,
-                                                'metadata': {
-                                                    'vwap': vwap,
-                                                    'rsi': rsi,
-                                                    'atr_pct': atr_pct,
-                                                    'current_price': current_price
-                                                }
-                                            })
+                                        if parent_trade.orderStatus.status != 'Filled':
+                                            self.log(logging.WARNING, f"❌ BUY order NOT filled after 5 seconds. Status: {parent_trade.orderStatus.status}. Will check in pending orders.")
+                                            continue  # Skip OCO placement, will handle in pending orders section
+                                        
+                                        # BUY confirmed as FILLED
+                                        fill_price = parent_trade.orderStatus.avgFillPrice
+                                        filled_quantity = parent_trade.orderStatus.filled
+                                        self.log(logging.INFO, f"✅ STEP 1 COMPLETE: BUY FILLED - {filled_quantity} shares of {contract.symbol} at ${fill_price:.2f}")
+                                        
+                                        # ============================================================
+                                        # STEP 2: VERIFY POSITION EXISTS IN IBKR
+                                        # ============================================================
+                                        self.log(logging.INFO, f"⏳ STEP 2: Verifying position exists in IBKR account...")
+                                        self.ib.sleep(1)  # Give IBKR time to register the position
+                                        
+                                        # Refresh positions from IBKR
+                                        ibkr_positions = self.ib.positions()
+                                        position_found = False
+                                        for pos in ibkr_positions:
+                                            if pos.contract.symbol == contract.symbol and pos.position == filled_quantity:
+                                                position_found = True
+                                                self.log(logging.INFO, f"✅ STEP 2 COMPLETE: Position verified in IBKR - {pos.position} shares @ ${pos.avgCost:.2f}")
+                                                break
+                                        
+                                        if not position_found:
+                                            self.log(logging.ERROR, f"❌ STEP 2 FAILED: Position NOT found in IBKR! Cannot place OCO orders safely.")
+                                            continue  # CRITICAL: Do not place OCO if position not confirmed
+                                        
+                                        # ============================================================
+                                        # STEP 3: PLACE OCO BRACKET ORDERS (ONLY AFTER VERIFICATION)
+                                        # ============================================================
+                                        self.log(logging.INFO, f"⏳ STEP 3: Placing OCO bracket orders...")
+                                        
+                                        # Recalculate based on ACTUAL fill price
+                                        actual_take_profit = fill_price * (1 + self.profit_target_pct)  # +4.0%
+                                        actual_stop_loss = fill_price * (1 - self.stop_loss_pct)        # -1.3%
+                                        
+                                        # Create unique OCA (One-Cancels-All) group for this position
+                                        oca_group = f"OCA_{contract.symbol}_{int(time.time())}"
+                                        
+                                        # Take Profit order (LIMIT SELL)
+                                        take_profit_order = LimitOrder('SELL', filled_quantity, actual_take_profit)
+                                        take_profit_order.ocaGroup = oca_group
+                                        take_profit_order.ocaType = 1  # Cancel all when one fills
+                                        take_profit_order.tif = 'DAY'
+                                        take_profit_order.outsideRth = False
+                                        
+                                        # Stop Loss order (STOP SELL)
+                                        stop_loss_order = StopOrder('SELL', filled_quantity, actual_stop_loss)
+                                        stop_loss_order.ocaGroup = oca_group  # SAME group as take profit
+                                        stop_loss_order.ocaType = 1  # Cancel all when one fills
+                                        stop_loss_order.tif = 'DAY'
+                                        stop_loss_order.outsideRth = False
+                                        
+                                        # Place OCO orders with proper delays
+                                        tp_trade = self.ib.placeOrder(trade_contract, take_profit_order)
+                                        self.ib.sleep(1)  # Wait for TP to be accepted
+                                        sl_trade = self.ib.placeOrder(trade_contract, stop_loss_order)
+                                        self.ib.sleep(3)  # Wait for SL to be accepted
+                                        
+                                        # Verify OCO orders were accepted
+                                        tp_status = tp_trade.orderStatus.status
+                                        sl_status = sl_trade.orderStatus.status
+                                        
+                                        if tp_status in ['Submitted', 'PreSubmitted']:
+                                            self.log(logging.INFO, f"✅ TP order accepted: ${actual_take_profit:.2f} (+{self.profit_target_pct*100:.1f}%) [Status: {tp_status}]")
                                         else:
-                                            self.log(logging.WARNING, f"Buy order for {contract.symbol} not filled after 3 seconds. Status: {parent_trade.orderStatus.status}. Will check next iteration.")
+                                            self.log(logging.ERROR, f"❌ TP order FAILED! Status: {tp_status}")
+                                        
+                                        if sl_status in ['Submitted', 'PreSubmitted']:
+                                            self.log(logging.INFO, f"✅ SL order accepted: ${actual_stop_loss:.2f} (-{self.stop_loss_pct*100:.1f}%) [Status: {sl_status}]")
+                                        else:
+                                            self.log(logging.ERROR, f"❌ SL order FAILED! Status: {sl_status}")
+                                        
+                                        self.log(logging.INFO, f"✅ STEP 3 COMPLETE: OCO Bracket placed - OCA Group: {oca_group}")
+                                        
+                                        # Store position with OCO bracket references
+                                        self.positions[contract.symbol] = {
+                                            "quantity": filled_quantity,
+                                            "entry_price": fill_price,
+                                            "contract": contract,
+                                            "atr_pct": atr_pct,
+                                            "take_profit_trade": tp_trade,  # Reference to TP order
+                                            "stop_loss_trade": sl_trade,    # Reference to SL order (OCO)
+                                            "stop_loss_price": actual_stop_loss,
+                                            "take_profit_price": actual_take_profit,
+                                            "oca_group": oca_group  # Track OCO group
+                                        }
+                                        
+                                        # DATABASE COORDINATION: Register position in shared database
+                                        # This allows Exit Manager to see and manage this position
+                                        self.db.add_active_position(
+                                            symbol=contract.symbol,
+                                            quantity=filled_quantity,
+                                            entry_price=fill_price,
+                                            agent_name='day_trader',
+                                            profit_target=actual_take_profit,
+                                            stop_loss=actual_stop_loss
+                                        )
+                                        
+                                        # DATABASE: Log the entry trade
+                                        self.db.log_trade({
+                                            'symbol': contract.symbol,
+                                            'action': 'BUY',
+                                            'quantity': filled_quantity,
+                                            'price': fill_price,
+                                            'agent_name': 'day_trader',
+                                            'reason': f'Entry signal: Price>${vwap:.2f} VWAP, RSI={rsi:.2f}<60, ATR={atr_pct:.2f}%',
+                                            'metadata': {
+                                                'rsi': rsi,
+                                                'vwap': vwap,
+                                                'atr_pct': atr_pct,
+                                                'take_profit': actual_take_profit,
+                                                'stop_loss': actual_stop_loss
+                                            }
+                                        })
+                                        
+                                        self.log(logging.INFO, f"✅ Position registered in database: {contract.symbol} @ ${fill_price:.2f}")
+                                        
+                                        # Remove from pending
+                                        del self.pending_orders[contract.symbol]
+                                        
+                                        # Add to blacklist (prevent re-entry)
+                                        self.traded_today.add(contract.symbol)
                             else:
                                 # Log why we're NOT buying
                                 reasons = []
