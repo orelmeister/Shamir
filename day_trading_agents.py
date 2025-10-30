@@ -1073,38 +1073,57 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.log(logging.INFO, "Autonomous systems enabled: Observability, Self-Evaluation, Continuous Improvement")
 
     def _connect_to_brokerage(self):
-        """Connects to Interactive Brokers."""
+        """Connects to Interactive Brokers with retry logic."""
         self.log(logging.INFO, "Connecting to Interactive Brokers...")
+        
+        # If already connected from pre-market phase, just verify and continue
+        if hasattr(self, 'ib') and self.ib and self.ib.isConnected():
+            self.log(logging.INFO, f"✅ Already connected to IBKR from pre-market phase. Account: {self.ib.managedAccounts()}")
+            return
+        
+        # Create new connection with retry logic
         self.ib = IB()
-        try:
-            # Adjust host and port if not using default TWS/Gateway settings
-            # IB Gateway default is 4001 for both live and paper.
-            # TWS default is 7496 for live and 7497 for paper.
-            port = 4001 if self.paper_trade else 4001
-            client_id = 2  # Use same ID as pre-market phase to avoid conflicts
-            self.log(logging.INFO, f"Attempting connection to 127.0.0.1:{port} with clientId={client_id}...")
-            
-            # Python 3.12 fix: Ensure event loop exists before connecting
-            import asyncio
-            import ib_insync.util as ib_util
+        
+        # Connection parameters
+        port = 4001 if self.paper_trade else 4001
+        client_id = 2  # Use same ID as pre-market phase to avoid conflicts
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(1, max_retries + 1):
             try:
-                asyncio.get_event_loop()
-            except RuntimeError:
-                # Create new event loop if none exists
-                asyncio.set_event_loop(asyncio.new_event_loop())
-            
-            ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id))
-            
-            # Verify connection
-            if not self.ib.isConnected():
-                raise ConnectionError("Connection established but not confirmed")
-            
-            self.log(logging.INFO, f"Successfully connected to Interactive Brokers. Account: {self.ib.managedAccounts()}")
-        except Exception as e:
-            self.log(logging.ERROR, f"Failed to connect to Interactive Brokers: {e}")
-            import traceback
-            self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
-            raise ConnectionError("Could not connect to IBKR. Is TWS or Gateway running?")
+                self.log(logging.INFO, f"Connection attempt {attempt}/{max_retries} to 127.0.0.1:{port} with clientId={client_id}...")
+                
+                # Python 3.12 fix: Ensure event loop exists before connecting
+                import asyncio
+                import ib_insync.util as ib_util
+                try:
+                    asyncio.get_event_loop()
+                except RuntimeError:
+                    # Create new event loop if none exists
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                
+                # Increase timeout to 10 seconds (from default 4)
+                ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id, timeout=10))
+                
+                # Verify connection
+                if not self.ib.isConnected():
+                    raise ConnectionError("Connection established but not confirmed")
+                
+                self.log(logging.INFO, f"✅ Successfully connected to Interactive Brokers. Account: {self.ib.managedAccounts()}")
+                return  # Success!
+                
+            except Exception as e:
+                self.log(logging.ERROR, f"Connection attempt {attempt}/{max_retries} failed: {e}")
+                
+                if attempt < max_retries:
+                    self.log(logging.INFO, f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    self.log(logging.ERROR, f"CRITICAL: All {max_retries} connection attempts failed")
+                    import traceback
+                    self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
+                    raise ConnectionError("Could not connect to IBKR after multiple attempts. Is TWS or Gateway running?")
 
     def _load_watchlist(self):
         """Loads the watchlist from the JSON file with intraday momentum data."""
@@ -1217,17 +1236,29 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     take_profit = entry_price * (1 + self.profit_target_pct)
                     stop_loss_price = entry_price * (1 - self.stop_loss_pct)
                     
-                    # Place profit target order (LimitOrder)
+                    # Create OCA (One-Cancels-All) group for OCO bracket
+                    oca_group = f"OCA_{symbol}_{int(time.time())}"
+                    
+                    # Place OCO bracket: Take Profit (LIMIT) + Stop Loss (STOP)
                     tp_order = LimitOrder('SELL', quantity, take_profit)
-                    tp_order.tif = 'DAY'  # Good for today only
-                    tp_order.outsideRth = True
-                    tp_order.transmit = True
+                    tp_order.ocaGroup = oca_group
+                    tp_order.ocaType = 1  # Cancel remaining on fill
+                    tp_order.tif = 'DAY'
+                    tp_order.outsideRth = False
+                    
+                    sl_order = StopOrder('SELL', quantity, stop_loss_price)
+                    sl_order.ocaGroup = oca_group
+                    sl_order.ocaType = 1  # Cancel remaining on fill
+                    sl_order.tif = 'DAY'
+                    sl_order.outsideRth = False
+                    
                     tp_trade = self.ib.placeOrder(contract, tp_order)
-                    self.ib.sleep(1.0)  # Increased wait time for order to process
+                    sl_trade = self.ib.placeOrder(contract, sl_order)
+                    self.ib.sleep(0.5)  # Brief pause between orders
                     
                     self.log(logging.INFO, f"SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
-                    self.log(logging.INFO, f"   Placed profit target: SELL {quantity} @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%)")
-                    self.log(logging.INFO, f"   Order status: {tp_trade.orderStatus.status}, Order ID: {tp_trade.order.orderId}")
+                    self.log(logging.INFO, f"   OCO Bracket: TP @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                    self.log(logging.INFO, f"   OCA Group: {oca_group}")
                     
                     # Create position entry in our tracking dictionary
                     self.positions[symbol] = {
@@ -1236,7 +1267,10 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         "contract": contract,
                         "atr_pct": None,  # Unknown from IBKR, will be recalculated
                         "take_profit_trade": tp_trade,
+                        "stop_loss_trade": sl_trade,
                         "stop_loss_price": stop_loss_price,
+                        "take_profit_price": take_profit,
+                        "oca_group": oca_group,
                         "entry_type": "SYNCED",
                         "entry_time": time.time()
                     }
@@ -1517,12 +1551,27 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     take_profit = fill_price * (1 + self.profit_target_pct)
                     stop_loss = fill_price * (1 - self.stop_loss_pct)
                     
-                    # Place profit target (LimitOrder)
-                    tp_order = LimitOrder('SELL', filled_qty, take_profit)
-                    tp_trade = self.ib.placeOrder(contract, tp_order)
+                    # Create OCA (One-Cancels-All) group for OCO bracket
+                    oca_group = f"OCA_{symbol}_{int(time.time())}"
                     
-                    self.log(logging.INFO, f"   Profit target: ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%)")
-                    self.log(logging.INFO, f"   Stop loss: ${stop_loss:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                    # Place OCO bracket: Take Profit (LIMIT) + Stop Loss (STOP)
+                    tp_order = LimitOrder('SELL', filled_qty, take_profit)
+                    tp_order.ocaGroup = oca_group
+                    tp_order.ocaType = 1  # Cancel remaining on fill
+                    tp_order.tif = 'DAY'
+                    tp_order.outsideRth = False
+                    
+                    sl_order = StopOrder('SELL', filled_qty, stop_loss)
+                    sl_order.ocaGroup = oca_group
+                    sl_order.ocaType = 1  # Cancel remaining on fill
+                    sl_order.tif = 'DAY'
+                    sl_order.outsideRth = False
+                    
+                    tp_trade = self.ib.placeOrder(contract, tp_order)
+                    sl_trade = self.ib.placeOrder(contract, sl_order)
+                    
+                    self.log(logging.INFO, f"   OCO Bracket: TP @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                    self.log(logging.INFO, f"   OCA Group: {oca_group}")
                     
                     # Add to positions (SAME dict as scanner entries)
                     self.positions[symbol] = {
@@ -1531,7 +1580,10 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         "contract": contract,
                         "atr_pct": None,  # No ATR for MOO entries
                         "take_profit_trade": tp_trade,
+                        "stop_loss_trade": sl_trade,
                         "stop_loss_price": stop_loss,
+                        "take_profit_price": take_profit,
+                        "oca_group": oca_group,
                         "entry_type": "MOO",  # Tag as MOO entry
                         "entry_time": time.time()
                     }
