@@ -350,9 +350,25 @@ class DayTraderOrchestrator:
                     # Get current order symbols
                     current_symbols = [moo['symbol'] for moo in intraday_agent.moo_trades] if hasattr(intraday_agent, 'moo_trades') else []
                     
-                    # Get new top stocks from updated rankings
+                    # Get new top stocks from updated rankings - FILTER OUT NEGATIVE PRE-MARKET MOVEMENT
                     max_moo_orders = min(5, 4 - len(intraday_agent.positions))
-                    new_top_stocks = [item.get('ticker') for item in intraday_agent.watchlist_data[:max_moo_orders]]
+                    
+                    # Filter: Only stocks with NON-NEGATIVE pre-market movement (>= -1.0% to allow small dips)
+                    filtered_stocks = []
+                    for item in intraday_agent.watchlist_data:
+                        ticker = item.get('ticker')
+                        premarket_change = item.get('premarket_change', 0)  # Default to 0 if missing
+                        
+                        # Accept stocks with >= -1.0% pre-market change (positive or small dip only)
+                        if premarket_change >= -1.0:
+                            filtered_stocks.append(ticker)
+                            if len(filtered_stocks) >= max_moo_orders:
+                                break
+                        else:
+                            # Log rejected stocks for visibility
+                            self.log(logging.INFO, f"REJECTED {ticker}: Pre-market {premarket_change:+.2f}% (too negative)")
+                    
+                    new_top_stocks = filtered_stocks
                     
                     # Determine which orders to cancel (no longer in top rankings)
                     to_cancel = [symbol for symbol in current_symbols if symbol not in new_top_stocks]
@@ -370,7 +386,7 @@ class DayTraderOrchestrator:
                         self.log(logging.INFO, f"Keeping orders for stocks still in top rankings: {', '.join(to_keep)}")
                     
                     if to_add:
-                        self.log(logging.INFO, f"Adding new orders for stocks that moved up: {', '.join(to_add)}")
+                        self.log(logging.INFO, f"Adding new orders for stocks in top rankings (with positive momentum): {', '.join(to_add)}")
                         # Place new MOO orders (will only place for stocks not already ordered)
                         intraday_agent._place_moo_orders()
                     
