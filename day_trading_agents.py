@@ -1258,12 +1258,22 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                     sl_order.outsideRth = False
                     
                     tp_trade = self.ib.placeOrder(contract, tp_order)
+                    self.ib.sleep(0.5)  # Wait for order to be accepted
                     sl_trade = self.ib.placeOrder(contract, sl_order)
-                    self.ib.sleep(0.5)  # Brief pause between orders
+                    self.ib.sleep(1)  # Wait for both orders to be transmitted
+                    
+                    # Verify orders were accepted
+                    tp_status = tp_trade.orderStatus.status
+                    sl_status = sl_trade.orderStatus.status
                     
                     self.log(logging.INFO, f"SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
                     self.log(logging.INFO, f"   OCO Bracket: TP @ ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
-                    self.log(logging.INFO, f"   OCA Group: {oca_group}")
+                    self.log(logging.INFO, f"   OCA Group: {oca_group}, TP Status: {tp_status}, SL Status: {sl_status}")
+                    
+                    if tp_status in ['Inactive', 'PendingCancel', 'Cancelled']:
+                        self.log(logging.ERROR, f"TP order NOT accepted for {symbol}! Status: {tp_status}")
+                    if sl_status in ['Inactive', 'PendingCancel', 'Cancelled']:
+                        self.log(logging.ERROR, f"SL order NOT accepted for {symbol}! Status: {sl_status}")
                     
                     # Create position entry in our tracking dictionary
                     self.positions[symbol] = {
@@ -1753,11 +1763,22 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             
                             try:
                                 tp_trade = self.ib.placeOrder(contract, tp_order)
+                                self.ib.sleep(0.5)  # Wait for order to be accepted
                                 sl_trade = self.ib.placeOrder(contract, sl_order)
+                                self.ib.sleep(1)  # Wait for both orders to be transmitted
+                                
+                                # Verify orders were accepted
+                                tp_status = tp_trade.orderStatus.status
+                                sl_status = sl_trade.orderStatus.status
                                 
                                 self.log(logging.INFO, f"OCO Bracket placed: TP @ ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
                                 self.log(logging.INFO, f"OCA Group: {oca_group}")
-                                self.log(logging.INFO, f"TP Order ID: {tp_trade.order.orderId}, SL Order ID: {sl_trade.order.orderId}")
+                                self.log(logging.INFO, f"TP Order ID: {tp_trade.order.orderId} (Status: {tp_status}), SL Order ID: {sl_trade.order.orderId} (Status: {sl_status})")
+                                
+                                if tp_status in ['Inactive', 'PendingCancel', 'Cancelled']:
+                                    self.log(logging.ERROR, f"TP order NOT accepted! Status: {tp_status}")
+                                if sl_status in ['Inactive', 'PendingCancel', 'Cancelled']:
+                                    self.log(logging.ERROR, f"SL order NOT accepted! Status: {sl_status}")
                             except Exception as e:
                                 self.log(logging.ERROR, f"FAILED to place OCO brackets for {symbol}: {e}")
                                 import traceback

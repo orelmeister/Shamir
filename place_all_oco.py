@@ -28,8 +28,8 @@ for pos in positions:
     # Use avgCost as entry price
     entry_price = avg_cost
     
-    # Calculate targets
-    take_profit = entry_price * 1.026  # +2.6%
+    # Calculate targets (UPDATED TO MATCH BOT)
+    take_profit = entry_price * 1.040  # +4.0%
     stop_loss = entry_price * 0.987    # -1.3%
     
     # Create OCA group
