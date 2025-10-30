@@ -1291,9 +1291,10 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.log(logging.INFO, "MOO PLACEMENT PHASE - Market-On-Open Orders")
         self.log(logging.INFO, "=" * 80)
         
-        # FIRST: Check existing orders in IBKR and cancel duplicates
+        # FIRST: Check existing orders in IBKR to avoid duplicates
         self.log(logging.INFO, "Checking for existing orders in IBKR...")
         existing_trades = self.ib.openTrades()
+        existing_order_symbols = set()
         
         if existing_trades:
             self.log(logging.INFO, f"Found {len(existing_trades)} existing orders in IBKR")
@@ -1306,11 +1307,10 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                 
                 self.log(logging.INFO, f"  Existing: {symbol} {action} {qty} ({order_type}, {status})")
                 
-                # Cancel existing MOO/MKT orders to avoid duplicates
-                if action == 'BUY' and order_type == 'MKT' and status in ['PreSubmitted', 'Submitted']:
-                    self.log(logging.WARNING, f"Cancelling existing order for {symbol} to avoid duplicate")
-                    self.ib.cancelOrder(trade.order)
-                    self.ib.sleep(0.5)
+                # Track BUY orders to avoid placing duplicates
+                if action == 'BUY' and status in ['PreSubmitted', 'Submitted']:
+                    existing_order_symbols.add(symbol)
+                    self.log(logging.INFO, f"  ✅ Will skip {symbol} - already have pending BUY order")
         else:
             self.log(logging.INFO, "No existing orders found in IBKR")
         
@@ -1355,6 +1355,11 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             # Skip if already have position or pending order
             if symbol in self.positions:
                 self.log(logging.INFO, f"Skipping {symbol} - already have position")
+                continue
+            
+            # Skip if already have pending order in IBKR
+            if symbol in existing_order_symbols:
+                self.log(logging.INFO, f"Skipping {symbol} - already have pending order in IBKR")
                 continue
             
             try:
