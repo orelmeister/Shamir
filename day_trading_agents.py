@@ -1746,11 +1746,17 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             sl_order.tif = 'DAY'
                             sl_order.outsideRth = False
                             
-                            tp_trade = self.ib.placeOrder(contract, tp_order)
-                            sl_trade = self.ib.placeOrder(contract, sl_order)
-                            
-                            self.log(logging.INFO, f"OCO Bracket placed: TP @ ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
-                            self.log(logging.INFO, f"OCA Group: {oca_group}")
+                            try:
+                                tp_trade = self.ib.placeOrder(contract, tp_order)
+                                sl_trade = self.ib.placeOrder(contract, sl_order)
+                                
+                                self.log(logging.INFO, f"OCO Bracket placed: TP @ ${take_profit_price:.2f} (+{self.profit_target_pct*100:.1f}%), SL @ ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%)")
+                                self.log(logging.INFO, f"OCA Group: {oca_group}")
+                                self.log(logging.INFO, f"TP Order ID: {tp_trade.order.orderId}, SL Order ID: {sl_trade.order.orderId}")
+                            except Exception as e:
+                                self.log(logging.ERROR, f"FAILED to place OCO brackets for {symbol}: {e}")
+                                import traceback
+                                self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
                             
                             # Store position with OCO bracket references
                             self.positions[symbol] = {
