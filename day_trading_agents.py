@@ -1030,7 +1030,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
     market hours based on technical indicators. It does NOT use an LLM for
     real-time decisions.
     """
-    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.026, stop_loss_pct=0.013):
+    def __init__(self, orchestrator, allocation, paper_trade=True, profit_target_pct=0.040, stop_loss_pct=0.013):
         super().__init__(orchestrator, "IntradayTraderAgent")
         self.allocation = allocation
         self.paper_trade = paper_trade
@@ -1043,6 +1043,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         self.positions = {} # To track open positions: { 'symbol': {...} }
         self.pending_orders = {} # Track pending orders: { 'symbol': {'trade': trade_obj, 'action': 'BUY', 'timestamp': time} }
         self.failed_orders = {} # Track recently failed/cancelled orders: { 'symbol': {'timestamp': time, 'reason': str} }
+        self.traded_today = set() # Blacklist symbols already traded (prevent re-entries)
         
         # Daily profit target tracking
         self.starting_capital = 0  # Set when trading starts (entire account NetLiquidation)
@@ -1133,13 +1134,17 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             watchlist_path = "day_trading_watchlist.json"
             if os.path.exists(watchlist_path):
                 with open(watchlist_path, 'r', encoding='utf-8-sig') as f:
-                    self.watchlist_data = json.load(f)
-                self.log(logging.INFO, f"Loaded {len(self.watchlist_data)} stocks from intraday scanner (day_trading_watchlist.json)")
+                    full_watchlist = json.load(f)
+                # LIMIT TO TOP 3 STOCKS (commission optimization)
+                self.watchlist_data = full_watchlist[:3]
+                self.log(logging.INFO, f"Loaded {len(full_watchlist)} stocks, trading TOP 3 from intraday scanner (day_trading_watchlist.json)")
             else:
                 # Fallback to ranked_tickers.json (pre-market analysis)
                 with open("ranked_tickers.json", 'r', encoding='utf-8-sig') as f:
-                    self.watchlist_data = json.load(f)
-                self.log(logging.INFO, f"Loaded {len(self.watchlist_data)} stocks from pre-market analysis (ranked_tickers.json)")
+                    full_watchlist = json.load(f)
+                # LIMIT TO TOP 3 STOCKS (commission optimization)
+                self.watchlist_data = full_watchlist[:3]
+                self.log(logging.INFO, f"Loaded {len(full_watchlist)} stocks, trading TOP 3 from pre-market analysis (ranked_tickers.json)")
             
             if not self.watchlist_data:
                 self.log(logging.WARNING, "Watchlist is empty after loading. No trades will be executed.")
@@ -2002,6 +2007,11 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             gap_entry = pre_market_gap >= 5.0  # 5%+ gap qualifies for momentum entry
                             standard_entry = current_price > vwap and (atr_pct is None or atr_pct >= 0.3)  # 0.3% for 30-sec bars
                             
+                            # BLACKLIST CHECK: Skip if already traded today (prevent re-entries)
+                            if contract.symbol in self.traded_today:
+                                self.log(logging.INFO, f"SKIPPING {contract.symbol}: Already traded today (no re-entries)")
+                                continue
+                            
                             # Gap plays bypass VWAP requirement (momentum continuation), standard plays require VWAP
                             if rsi < 60 and (gap_entry or standard_entry):
                                 quantity = int(self.capital_per_stock / current_price)
@@ -2384,6 +2394,8 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         })
                         
                         self.log(logging.INFO, f"LIQUIDATED {symbol}: Sold {position['quantity']} shares at ${exit_price:.2f}. P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+                        # Add to blacklist (prevent re-entry)
+                        self.traded_today.add(symbol)
                         del self.positions[symbol]
                     else:
                         self.log(logging.WARNING, f"Liquidation order for {symbol} not filled immediately. Status: {trade.orderStatus.status}")
