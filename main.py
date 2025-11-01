@@ -764,42 +764,54 @@ class PortfolioManagerAgent(BaseAgent):
             self.orchestrator.write_to_queue({"phase": "execution_complete", "executed_trades": []})
             return
 
-        # If market is closed, check if we can place MOO orders or need to wait
+        # If market is closed, try to place pre-market orders or wait for market open
         if not is_market_open():
-            # Check if we're in the MOO window (9:00-9:28 AM ET)
+            # Check current time in ET timezone
             ny_tz = pytz.timezone('America/New_York')
             now_ny = datetime.now(ny_tz)
-            moo_window_start = now_ny.replace(hour=9, minute=0, second=0, microsecond=0)
-            moo_window_end = now_ny.replace(hour=9, minute=28, second=0, microsecond=0)
             market_open_time = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
             
-            # If it's between 9:28-9:30 AM, wait for market to open and use limit orders
-            if moo_window_end < now_ny < market_open_time:
-                self.log(logging.WARNING, "Too late for MOO orders (after 9:28 AM). Waiting 2 minutes for market open to place LIMIT orders.")
-                import time
-                sleep_seconds = (market_open_time - now_ny).total_seconds() + 5  # Wait 5 sec after open
-                time.sleep(sleep_seconds)
-                self.log(logging.INFO, "Market now open. Placing LIMIT orders instead.")
-                trade_result = self._execute_rebalance(recommendation)
-            else:
-                self.log(logging.INFO, "Market is currently closed. Placing Market-On-Open (MOO) orders for 9:30 AM ET execution.")
-                trade_result = self._place_moo_orders(recommendation)
+            # Try to place pre-market orders (will check time window internally)
+            self.log(logging.INFO, "Market is currently closed. Attempting pre-market order placement...")
+            trade_result = self._place_moo_orders(recommendation)
+            
+            # Check if we were outside the safe window
+            if trade_result.get('status') == 'OUTSIDE_WINDOW':
+                self.log(logging.INFO, "Pre-market window closed. Checking when market opens...")
+                now_ny = datetime.now(ny_tz)
                 
-                # If MOO orders failed, fall back to waiting for market open
-                if trade_result.get('status') == 'FAILURE' or trade_result.get('status') == 'MOO_REJECTED':
-                    self.log(logging.ERROR, "MOO orders failed. Checking if market is about to open...")
-                    now_ny = datetime.now(ny_tz)
-                    if now_ny.hour == 9 and now_ny.minute >= 28:
-                        # Market opens soon, wait and place limit orders
-                        sleep_seconds = max(0, (market_open_time - now_ny).total_seconds() + 5)
-                        if sleep_seconds < 300:  # Only wait if less than 5 minutes
-                            self.log(logging.INFO, f"Waiting {sleep_seconds:.0f} seconds for market open to place LIMIT orders...")
-                            import time
-                            time.sleep(sleep_seconds)
-                            self.log(logging.INFO, "Market now open. Placing LIMIT orders as fallback.")
-                            trade_result = self._execute_rebalance(recommendation)
-                        else:
-                            self.log(logging.ERROR, "Too early to wait for market open. Exiting.")
+                # If market opens soon (within 5 minutes), wait for it
+                time_until_open = (market_open_time - now_ny).total_seconds()
+                if 0 < time_until_open <= 300:  # 0-5 minutes until open
+                    self.log(logging.INFO, f"Market opens in {time_until_open:.0f} seconds. Waiting to place LIMIT orders...")
+                    import time
+                    time.sleep(time_until_open + 5)  # Wait 5 sec after open
+                    self.log(logging.INFO, "✅ Market now open. Placing LIMIT orders.")
+                    trade_result = self._execute_rebalance(recommendation)
+                elif time_until_open > 300:
+                    self.log(logging.ERROR, f"Market opens in {time_until_open/60:.1f} minutes. Too long to wait. Exiting.")
+                    trade_result = {"status": "FAILURE", "reason": "Too early to place orders"}
+                else:
+                    # Market already opened (time_until_open <= 0)
+                    self.log(logging.INFO, "Market already open. Placing LIMIT orders now.")
+                    trade_result = self._execute_rebalance(recommendation)
+            
+            # Handle any other failures
+            elif trade_result.get('status') in ['FAILURE', 'MOO_REJECTED']:
+                self.log(logging.ERROR, "Pre-market order placement failed. Attempting fallback to market-open execution...")
+                now_ny = datetime.now(ny_tz)
+                time_until_open = (market_open_time - now_ny).total_seconds()
+                
+                if 0 < time_until_open <= 300:
+                    self.log(logging.INFO, f"Waiting {time_until_open:.0f} seconds for market open...")
+                    import time
+                    time.sleep(time_until_open + 5)
+                    trade_result = self._execute_rebalance(recommendation)
+                elif time_until_open <= 0:
+                    self.log(logging.INFO, "Market already open. Executing now.")
+                    trade_result = self._execute_rebalance(recommendation)
+                else:
+                    self.log(logging.ERROR, "Cannot place orders - too early and pre-market failed.")
             
             self.orchestrator.write_to_queue({
                 "phase": "execution_complete",
@@ -929,14 +941,30 @@ class PortfolioManagerAgent(BaseAgent):
 
     def _place_moo_orders(self, recommendation):
         """
-        Place Market-On-Open (MOO) orders when market is closed.
-        MOO orders execute at 9:30 AM ET at the opening price.
+        Place pre-market orders that execute at 9:30 AM ET market open.
+        Uses MKT orders (not MOO type) which are more forgiving on timing.
+        Only places orders if we're in the safe window (9:00-9:27 AM ET).
         """
-        self.log(logging.INFO, "=== Placing MOO Orders for Market Open ===")
+        # CRITICAL: Check if we're in the safe time window for pre-market orders
+        ny_tz = pytz.timezone('America/New_York')
+        now_ny = datetime.now(ny_tz)
+        current_time = now_ny.time()
+        
+        # Safe window: 9:00-9:27 AM ET (3-minute buffer before issues can occur)
+        window_start = datetime.strptime("09:00", "%H:%M").time()
+        window_end = datetime.strptime("09:27", "%H:%M").time()
+        
+        if not (window_start <= current_time <= window_end):
+            self.log(logging.WARNING, f"⏰ Outside safe pre-market window (9:00-9:27 AM ET). Current time: {now_ny.strftime('%H:%M:%S')} ET")
+            self.log(logging.INFO, "Will use market-open execution with LIMIT orders instead.")
+            return {"status": "OUTSIDE_WINDOW", "reason": f"Current time {now_ny.strftime('%H:%M:%S')} ET outside 9:00-9:27 AM window", "moo_orders": []}
+        
+        self.log(logging.INFO, f"✅ Within safe pre-market window: {now_ny.strftime('%H:%M:%S')} ET (9:00-9:27 AM)")
+        self.log(logging.INFO, "=== Placing Pre-Market Orders for Market Open ===")
         
         ib = IB()
         try:
-            self.log(logging.INFO, "Connecting to IBKR for MOO order placement...")
+            self.log(logging.INFO, "Connecting to IBKR for pre-market order placement...")
             # Use util.run() for Python 3.12+ compatibility
             util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
             ib.reqMarketDataType(3)
@@ -991,19 +1019,21 @@ class PortfolioManagerAgent(BaseAgent):
                     order = Order(
                         action=action,
                         totalQuantity=num_shares,
-                        orderType='MOO',  # Market-On-Open
-                        outsideRth=True
+                        orderType='MKT',  # Market order - executes at open when placed pre-market
+                        tif='DAY',
+                        outsideRth=True,
+                        transmit=True
                     )
                     trade = ib.placeOrder(contract, order)
                     ib.sleep(1)  # Wait for order status
                     
                     # Check if order was rejected
                     if trade.orderStatus.status == 'Cancelled' or 'Error' in str(trade.log):
-                        self.log(logging.ERROR, f"❌ MOO order rejected for {symbol}: {trade.log[-1].message if trade.log else 'Unknown error'}")
-                        return {"status": "MOO_REJECTED", "reason": "IBKR rejected MOO order - likely past 9:28 AM cutoff", "moo_orders": []}
+                        self.log(logging.ERROR, f"❌ Pre-market order rejected for {symbol}: {trade.log[-1].message if trade.log else 'Unknown error'}")
+                        return {"status": "MOO_REJECTED", "reason": "IBKR rejected pre-market order", "moo_orders": []}
                     
-                    self.log(logging.INFO, f"📋 Placed MOO order: {action} {num_shares} {symbol} (executes at 9:30 AM)")
-                    moo_orders_placed.append(f"{action} {num_shares} {symbol} (MOO)")
+                    self.log(logging.INFO, f"📋 Placed pre-market order: {action} {num_shares} {symbol} (executes at 9:30 AM open)")
+                    moo_orders_placed.append(f"{action} {num_shares} {symbol} (MKT@open)")
             
             # Place MOO order for new ticker
             if new_ticker not in [pos.contract.symbol for pos in current_positions]:
@@ -1020,19 +1050,21 @@ class PortfolioManagerAgent(BaseAgent):
                         order = Order(
                             action='BUY',
                             totalQuantity=quantity,
-                            orderType='MOO',
-                            outsideRth=True
+                            orderType='MKT',  # Market order - executes at open when placed pre-market
+                            tif='DAY',
+                            outsideRth=True,
+                            transmit=True
                         )
                         trade = ib.placeOrder(new_contract, order)
                         ib.sleep(1)  # Wait for order status
                         
                         # Check if order was rejected
                         if trade.orderStatus.status == 'Cancelled' or 'Error' in str(trade.log):
-                            self.log(logging.ERROR, f"❌ MOO order rejected for {new_ticker}: {trade.log[-1].message if trade.log else 'Unknown error'}")
-                            return {"status": "MOO_REJECTED", "reason": "IBKR rejected MOO order - likely past 9:28 AM cutoff", "moo_orders": []}
+                            self.log(logging.ERROR, f"❌ Pre-market order rejected for {new_ticker}: {trade.log[-1].message if trade.log else 'Unknown error'}")
+                            return {"status": "MOO_REJECTED", "reason": "IBKR rejected pre-market order", "moo_orders": []}
                         
-                        self.log(logging.INFO, f"📋 Placed MOO order: BUY {quantity} {new_ticker} (executes at 9:30 AM)")
-                        moo_orders_placed.append(f"BUY {quantity} {new_ticker} (MOO)")
+                        self.log(logging.INFO, f"📋 Placed pre-market order: BUY {quantity} {new_ticker} (executes at 9:30 AM open)")
+                        moo_orders_placed.append(f"BUY {quantity} {new_ticker} (MKT@open)")
                         
                         # Add position tracking with estimated entry price
                         # Will be updated with actual fill price when market opens
@@ -1042,15 +1074,15 @@ class PortfolioManagerAgent(BaseAgent):
                     self.log(logging.ERROR, f"Could not estimate price for {new_ticker}. Skipping MOO order.")
             
             if not moo_orders_placed:
-                self.log(logging.INFO, "Portfolio already balanced. No MOO orders needed.")
+                self.log(logging.INFO, "Portfolio already balanced. No pre-market orders needed.")
                 return {"status": "SUCCESS", "reason": "Already balanced.", "moo_orders": []}
             
-            self.log(logging.INFO, f"✅ Placed {len(moo_orders_placed)} MOO orders. They will execute at market open (9:30 AM ET).")
+            self.log(logging.INFO, f"✅ Placed {len(moo_orders_placed)} pre-market orders. They will execute at market open (9:30 AM ET).")
             self.log(logging.INFO, "📊 Position tracking will be updated with actual fill prices after market open.")
             return {"status": "SUCCESS_MOO", "moo_orders": moo_orders_placed}
         
         except Exception as e:
-            self.log(logging.CRITICAL, f"Failed to place MOO orders: {e}", exc_info=True)
+            self.log(logging.CRITICAL, f"Failed to place pre-market orders: {e}", exc_info=True)
             return {"status": "FAILURE", "reason": str(e), "moo_orders": []}
         finally:
             if ib.isConnected():
