@@ -286,13 +286,27 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         news_items = []
         news_source = "None"
 
-        # Use ONLY Polygon for news (no yfinance fallback due to rate limits)
+        # 1. Try Polygon (last 3 days only)
         polygon_data = await self._fetch_polygon_news(session, ticker)
         if polygon_data.get("news"):
             news_items = polygon_data["news"]
             news_source = "Polygon"
-        else:
-            self.log(logging.DEBUG, f"No news from Polygon for {ticker}. Skipping news.")
+        
+        # 2. Fallback to FMP (Financial Modeling Prep)
+        if not news_items:
+            self.log(logging.DEBUG, f"No news from Polygon for {ticker}. Trying FMP.")
+            fmp_news_data = await self._fetch_fmp_news(session, ticker)
+            if fmp_news_data.get("news"):
+                news_items = fmp_news_data["news"]
+                news_source = "FMP"
+        
+        # 3. Final fallback to yfinance (if needed, though rate limited)
+        if not news_items:
+            self.log(logging.DEBUG, f"No news from FMP for {ticker}. Trying yfinance.")
+            yfinance_data = await self._fetch_yfinance_news(ticker)
+            if yfinance_data.get("news"):
+                news_items = yfinance_data["news"]
+                news_source = "yfinance"
 
         self.log(logging.DEBUG, f"Found {len(news_items)} news items for {ticker} from {news_source}.")
 
@@ -367,6 +381,38 @@ class DataAggregatorAgent(BaseDayTraderAgent):
                 return {"news": news_items}
         except Exception as e:
             self.log(logging.ERROR, f"[Polygon] News error for {ticker}: {e}")
+            return {"news": [], "error": str(e)}
+
+    async def _fetch_fmp_news(self, session, ticker):
+        """
+        Fetch news from FMP (Financial Modeling Prep) API.
+        Uses stock_news endpoint for intraday trading - gets recent news with full text.
+        """
+        url = f"https://financialmodelingprep.com/api/v3/stock_news"
+        params = {
+            "tickers": ticker,
+            "limit": NEWS_FETCH_LIMIT,
+            "apikey": FMP_API_KEY
+        }
+        try:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                # FMP provides text (full content), title, publishedDate, site, and url
+                news_items = [
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("text", ""),  # FMP's full text content
+                        "published_date": item.get("publishedDate", ""),
+                        "site": item.get("site", "")
+                    } 
+                    for item in data
+                ]
+                self.log(logging.DEBUG, f"[FMP] Fetched {len(news_items)} news items for {ticker}.")
+                return {"news": news_items}
+        except Exception as e:
+            self.log(logging.ERROR, f"[FMP] News error for {ticker}: {e}")
             return {"news": [], "error": str(e)}
 
     async def _fetch_yfinance_news(self, ticker):
@@ -2023,6 +2069,13 @@ class IntradayTraderAgent(BaseDayTraderAgent):
 
                         # Entry Logic: No position is open AND no pending order AND not recently failed
                         if position is None and contract.symbol not in self.pending_orders:
+                            # CRITICAL: Check max positions limit BEFORE placing any new orders
+                            total_positions = len(self.positions) + len(self.pending_orders)
+                            MAX_CONCURRENT_POSITIONS = 2  # Max 2 positions at once (conservative)
+                            
+                            if total_positions >= MAX_CONCURRENT_POSITIONS:
+                                self.log(logging.INFO, f"⏸️  At max capacity ({total_positions}/{MAX_CONCURRENT_POSITIONS} positions). Skipping {contract.symbol}")
+                                continue
                             # Check if order recently failed/cancelled (wait before retry)
                             if contract.symbol in self.failed_orders:
                                 failed_info = self.failed_orders[contract.symbol]
