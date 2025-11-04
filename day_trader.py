@@ -30,7 +30,17 @@ from day_trading_agents import (
 )
 from utils import setup_logging, is_market_open
 from observability import get_tracer, get_database
-# Removed deprecated imports - using observability module now
+
+# PDF report generation
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 class DayTraderOrchestrator:
     def __init__(self, allocation, paper_trade=True):
@@ -154,6 +164,145 @@ class DayTraderOrchestrator:
         trader_agent.run()
         
         self.log(logging.INFO, "Intraday Trading complete. All positions liquidated.")
+    
+    def generate_momentum_pdf_report(self, ranked_tickers, iteration=1):
+        """
+        Generate PDF report for pre-market momentum analysis.
+        Similar to weekly bot's portfolio review PDF.
+        """
+        if not REPORTLAB_AVAILABLE:
+            self.log(logging.WARNING, "reportlab not installed. Skipping PDF generation.")
+            return None
+        
+        try:
+            # Create reports folder
+            os.makedirs("day_trader_reports", exist_ok=True)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"day_trader_reports/momentum_analysis_{timestamp}_iter{iteration}.pdf"
+            
+            # Create PDF
+            doc = SimpleDocTemplate(filename, pagesize=letter)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=24,
+                textColor=colors.HexColor('#1f77b4'),
+                spaceAfter=30,
+                alignment=1  # Center
+            )
+            story.append(Paragraph(f"Day Trading Bot - Pre-Market Momentum Analysis", title_style))
+            story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M:%S %p ET')}", styles['Normal']))
+            story.append(Paragraph(f"Iteration #{iteration}", styles['Normal']))
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Executive Summary
+            story.append(Paragraph("Executive Summary", styles['Heading2']))
+            summary_data = [
+                ['Total Stocks Analyzed', str(len(ranked_tickers))],
+                ['Top 5 Momentum Plays', ', '.join([t['ticker'] for t in ranked_tickers[:5]])],
+                ['Report Time', datetime.now().strftime('%I:%M:%S %p ET')],
+                ['Market Status', 'Pre-Market' if not is_market_open() else 'Trading Hours']
+            ]
+            summary_table = Table(summary_data, colWidths=[2.5*inch, 4*inch])
+            summary_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e8f4f8')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 12),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ]))
+            story.append(summary_table)
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Top 10 Momentum Stocks Table
+            story.append(Paragraph("Top 10 Momentum Stocks", styles['Heading2']))
+            
+            table_data = [['Rank', 'Ticker', 'Confidence', 'Pre-Market %', 'Momentum Score']]
+            for i, stock in enumerate(ranked_tickers[:10], 1):
+                table_data.append([
+                    str(i),
+                    stock.get('ticker', 'N/A'),
+                    f"{stock.get('confidence_score', 0):.1f}%",
+                    f"{stock.get('premarket_change', 0):+.2f}%",
+                    f"{stock.get('momentum_score', 0):.2f}"
+                ])
+            
+            top_table = Table(table_data, colWidths=[0.7*inch, 1*inch, 1.2*inch, 1.3*inch, 1.5*inch])
+            top_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 11),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+            ]))
+            story.append(top_table)
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Detailed Analysis for Top 5
+            story.append(PageBreak())
+            story.append(Paragraph("Detailed Analysis - Top 5 Picks", styles['Heading2']))
+            story.append(Spacer(1, 0.2*inch))
+            
+            for i, stock in enumerate(ranked_tickers[:5], 1):
+                # Stock header
+                header_style = ParagraphStyle(
+                    'StockHeader',
+                    parent=styles['Heading3'],
+                    fontSize=14,
+                    textColor=colors.HexColor('#2ca02c') if stock.get('premarket_change', 0) >= 0 else colors.HexColor('#d62728'),
+                    spaceAfter=10
+                )
+                story.append(Paragraph(f"#{i}: {stock.get('ticker', 'N/A')} - Confidence {stock.get('confidence_score', 0):.1f}%", header_style))
+                
+                # Stock details
+                details_data = [
+                    ['Pre-Market Change', f"{stock.get('premarket_change', 0):+.2f}%"],
+                    ['Momentum Score', f"{stock.get('momentum_score', 0):.2f}"],
+                    ['Volume', f"{stock.get('volume', 0):,}"],
+                ]
+                
+                details_table = Table(details_data, colWidths=[2*inch, 3.5*inch])
+                details_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f5f5f5')),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ]))
+                story.append(details_table)
+                
+                # Reasoning
+                reasoning = stock.get('reasoning', 'No reasoning provided')
+                story.append(Spacer(1, 0.1*inch))
+                story.append(Paragraph("<b>Analysis:</b>", styles['Normal']))
+                story.append(Paragraph(reasoning, styles['Normal']))
+                story.append(Spacer(1, 0.2*inch))
+            
+            # Build PDF
+            doc.build(story)
+            
+            self.log(logging.INFO, f"[PDF] Report Generated: {filename}")
+            return filename
+            
+        except Exception as e:
+            self.log(logging.ERROR, f"Failed to generate PDF report: {e}")
+            return None
 
     def start(self):
         """
@@ -225,13 +374,13 @@ class DayTraderOrchestrator:
 
         # --- Phase -1: Ticker Screening (runs before Phase 0) ---
         self.log(logging.INFO, "=" * 60)
-        self.log(logging.INFO, "PHASE -1: Ticker Universe Refresh (6:55 AM)")
+        self.log(logging.INFO, "PHASE -1: Ticker Universe Refresh")
         self.log(logging.INFO, "=" * 60)
         self._run_ticker_screener()
 
-        # --- Phase 0: Data Aggregation (7:00 AM - with ATR filtering) ---
+        # --- Phase 0: Data Aggregation (can run anytime) ---
         self.log(logging.INFO, "=" * 60)
-        self.log(logging.INFO, "PHASE 0: Data Collection (7:00 AM)")
+        self.log(logging.INFO, "PHASE 0: Data Collection (runs anytime)")
         self.log(logging.INFO, "=" * 60)
         self.run_data_aggregation()
 
@@ -239,9 +388,9 @@ class DayTraderOrchestrator:
         # already filters by ATR > 1.0%. LLM prediction was too slow (27 stocks * DeepSeek calls)
         # and didn't add enough value to justify the time cost.
 
-        # --- Phase 1: Pre-Market Analysis (7:30 AM) ---
+        # --- Phase 1: Pre-Market Analysis (can run anytime) ---
         self.log(logging.INFO, "=" * 60)
-        self.log(logging.INFO, "PHASE 1: LLM Watchlist Analysis (7:30 AM)")
+        self.log(logging.INFO, "PHASE 1: LLM Watchlist Analysis (runs anytime)")
         self.log(logging.INFO, "=" * 60)
         self.run_pre_market_analysis()
         
@@ -332,6 +481,11 @@ class DayTraderOrchestrator:
                         json.dump(ranked_tickers, f, indent=2)
                     
                     self.log(logging.INFO, f"Momentum analysis complete. Top 5 stocks: {[t['ticker'] for t in ranked_tickers[:5]]}")
+                    
+                    # Generate PDF report for this momentum check
+                    pdf_file = self.generate_momentum_pdf_report(ranked_tickers, iteration=iteration)
+                    if pdf_file:
+                        self.log(logging.INFO, f"[OK] PDF report saved: {pdf_file}")
                     
                 except Exception as e:
                     self.log(logging.ERROR, f"Momentum analysis failed: {e}. Keeping previous rankings.")
