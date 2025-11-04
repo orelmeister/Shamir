@@ -1260,9 +1260,22 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         """
         Syncs the in-memory positions dictionary with actual IBKR positions.
         This is critical for recovering state after bot restarts.
+        UPDATED: Now checks shared_state/positions_state.json to avoid touching weekly bot positions.
         """
         try:
             self.log(logging.INFO, "Syncing positions from IBKR account...")
+            
+            # CRITICAL: Load weekly positions from shared state to avoid conflicts
+            weekly_positions = []
+            try:
+                from shared_state.state_manager import read_state
+                positions_state = read_state('positions_state')
+                weekly_positions = positions_state.get('weekly_positions', [])
+                if weekly_positions:
+                    self.log(logging.INFO, f"🔒 Found {len(weekly_positions)} weekly positions to exclude: {weekly_positions}")
+            except Exception as e:
+                self.log(logging.WARNING, f"Could not read weekly positions from shared state: {e}. Continuing without exclusions.")
+            
             ibkr_positions = self.ib.positions()
             
             if not ibkr_positions:
@@ -1272,6 +1285,11 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             synced_count = 0
             for pos in ibkr_positions:
                 symbol = pos.contract.symbol
+                
+                # CRITICAL: Exclude weekly bot positions (don't touch them!)
+                if symbol in weekly_positions:
+                    self.log(logging.INFO, f"⏭️ Skipping {symbol} - managed by weekly bot")
+                    continue
                 
                 # Only sync positions for stocks in our watchlist
                 watchlist_symbols = [item.get('ticker') for item in self.watchlist_data]
@@ -1358,6 +1376,33 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.log(logging.ERROR, f"Error syncing positions from IBKR: {e}")
             import traceback
             self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
+    
+    def _update_shared_state_positions(self):
+        """
+        Update shared_state/positions_state.json with current day trader positions.
+        This allows weekly bot to know which positions NOT to touch.
+        """
+        try:
+            from shared_state.state_manager import read_state, write_state
+            
+            # Get current day trader positions
+            day_trader_symbols = list(self.positions.keys())
+            
+            # Read existing state
+            positions_state = read_state('positions_state')
+            
+            # Update day trader positions
+            positions_state['day_trader_positions'] = day_trader_symbols
+            positions_state['day_trader_last_updated'] = datetime.now().isoformat()
+            
+            # Write back
+            write_state('positions_state', positions_state)
+            
+            self.log(logging.DEBUG, f"Updated shared state with {len(day_trader_symbols)} day trader positions")
+        
+        except Exception as e:
+            self.log(logging.WARNING, f"Could not update shared state positions: {e}")
+            # Non-critical - don't fail if shared state update fails
 
     def _check_daily_profit_target(self):
         """
