@@ -7,15 +7,17 @@ import logging
 import os
 import sys
 from datetime import datetime
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ib_insync import IB, Stock
 import ib_insync.util as ib_util
-from langchain_community.chat_models import ChatOllama
-from langchain_google_vertexai import ChatVertexAI
 from langchain_deepseek import ChatDeepSeek
 
 # Import shared utilities
@@ -29,10 +31,10 @@ MIN_CONFIDENCE_SCORE = 0.75
 MAX_POSITIONS = 5
 IB_HOST = '127.0.0.1'
 IB_PORT = 4001
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 # LLM API Keys
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-FORCE_ONLINE_LLMS = os.getenv('FORCE_ONLINE_LLMS', 'false').lower() == 'true'
 
 # Generate run ID
 RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -76,19 +78,12 @@ def validate_ticker_in_ibkr(ticker):
         return False
 
 
-def analysis_worker(stock_data, worker_id, force_online_llms):
-    """Worker function for parallel analysis using LLMs."""
-    # Setup worker-specific logger
-    worker_log = os.path.join(log_dir, f'analyst_worker_{RUN_ID}_{worker_id}.log')
-    worker_logger = logging.getLogger(f'analyst_worker_{worker_id}')
-    worker_logger.setLevel(logging.INFO)
-    if not worker_logger.hasHandlers():
-        file_handler = logging.FileHandler(worker_log, mode='w')
-        file_handler.setFormatter(logging.Formatter(f'%(asctime)s - [Analyst-{worker_id}] - %(message)s'))
-        worker_logger.addHandler(file_handler)
-
+def analysis_worker(stock_data, worker_id):
+    """Worker function for parallel analysis using LLMs. Thread-safe version."""
     ticker = stock_data.get("ticker", "Unknown")
-    worker_logger.info(f"Starting analysis for {ticker}")
+    
+    # Thread-safe logging (just use main logger)
+    logger.info(f"Starting analysis for {ticker}")
 
     prompt = f"""
     You are an aggressive growth stock analyst targeting 50%+ returns in 30 days.
@@ -121,42 +116,24 @@ def analysis_worker(stock_data, worker_id, force_online_llms):
     """
     
     try:
-        # Dynamic LLM Switching
-        if force_online_llms or is_market_open():
-            if force_online_llms:
-                worker_logger.info(f"FORCE_ONLINE_LLMS is True. Using online models for {ticker}.")
-            else:
-                worker_logger.info(f"Market is OPEN. Using online models for {ticker}.")
-            
-            try:
-                llm = ChatDeepSeek(model="deepseek-reasoner", api_key=DEEPSEEK_API_KEY)
-                model_name = 'DeepSeek'
-                response = llm.invoke(prompt)
-            except Exception as e:
-                worker_logger.warning(f"DeepSeek failed for {ticker}: {e}. Falling back to Gemini.")
-                llm = ChatVertexAI(model_name="gemini-2.5-flash")
-                model_name = 'Gemini'
-                response = llm.invoke(prompt)
-        else:
-            worker_logger.info(f"Market is CLOSED. Using local Ollama model for {ticker}.")
-            llm = ChatOllama(model="llama3.1:8b")
-            model_name = 'Ollama'
-            response = llm.invoke(prompt)
-
+        # Use DeepSeek REASONER model for deep analysis
+        logger.info(f"Analyzing {ticker} with DeepSeek...")
+        
+        llm = ChatDeepSeek(model="deepseek-reasoner", api_key=DEEPSEEK_API_KEY)
+        response = llm.invoke(prompt)
+        
         analysis = json.loads(response.content)
-        analysis['model'] = model_name
+        analysis['model'] = 'DeepSeek'
         
         final_result = stock_data.copy()
         final_result.update(analysis)
         return final_result
     except Exception as e:
-        worker_logger.error(f"Error analyzing {ticker}: {e}", exc_info=True)
+        logger.error(f"Error analyzing {ticker}: {e}", exc_info=True)
         return {"ticker": ticker, "decision": "ERROR", "reasoning": str(e)}
 
 
-def analysis_worker_wrapper(args):
-    """Helper to unpack arguments for imap_unordered."""
-    return analysis_worker(*args)
+
 
 
 def main():
@@ -185,22 +162,39 @@ def main():
         })
         sys.exit(0)
     
-    logger.info(f"Analyzing {len(stocks_to_analyze)} stocks in parallel using {cpu_count()} workers")
+    # Use up to 100 threads for HTTP I/O bound tasks (threads are lightweight, no paging file issues)
+    MAX_WORKERS = 100
+    num_workers = min(MAX_WORKERS, len(stocks_to_analyze))
+    logger.info(f"Analyzing {len(stocks_to_analyze)} stocks in parallel using {num_workers} threads (max {MAX_WORKERS})")
     
-    # Parallel analysis
+    # Parallel analysis using ThreadPoolExecutor (much lighter than multiprocessing)
     results = []
-    with Pool(processes=cpu_count()) as pool:
-        worker_args = [(stock, i, FORCE_ONLINE_LLMS) for i, stock in enumerate(stocks_to_analyze)]
+    total_stocks = len(stocks_to_analyze)
+    completed_count = 0
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_stock = {
+            executor.submit(analysis_worker, stock, i): stock 
+            for i, stock in enumerate(stocks_to_analyze)
+        }
         
-        total_stocks = len(stocks_to_analyze)
-        for i, result in enumerate(pool.imap_unordered(analysis_worker_wrapper, worker_args), 1):
-            if result:
-                results.append(result)
-                ticker = result.get('ticker', 'Unknown')
-                decision = result.get('decision', 'ERROR')
-                logger.info(f"Progress: [{i}/{total_stocks}] - {ticker}: {decision}")
-            else:
-                logger.warning(f"Progress: [{i}/{total_stocks}] - Worker returned no result")
+        # Process results as they complete
+        for future in as_completed(future_to_stock):
+            completed_count += 1
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+                    ticker = result.get('ticker', 'Unknown')
+                    decision = result.get('decision', 'ERROR')
+                    logger.info(f"Progress: [{completed_count}/{total_stocks}] - {ticker}: {decision}")
+                else:
+                    logger.warning(f"Progress: [{completed_count}/{total_stocks}] - Worker returned no result")
+            except Exception as e:
+                stock = future_to_stock[future]
+                ticker = stock.get('ticker', 'Unknown')
+                logger.error(f"Progress: [{completed_count}/{total_stocks}] - {ticker} failed: {e}")
     
     # Save full analysis results
     try:
@@ -230,7 +224,8 @@ def main():
     logger.info("Running Monte Carlo simulation to rank stocks...")
     mc_results = mc.run_monte_carlo_filter(buy_recommendations)
     
-    if not mc_results or not mc_results.get("ranked_tickers"):
+    # mc_results is a list of top picks
+    if not mc_results or not isinstance(mc_results, list):
         logger.error("Monte Carlo simulation failed to return rankings.")
         write_state('phase_state', {
             'current_phase': 'analysis_complete',
@@ -239,25 +234,24 @@ def main():
         })
         sys.exit(1)
     
-    ranked_tickers = mc_results["ranked_tickers"]
-    sharpe_ratios = mc_results["sharpe_ratios"]
+    ranked_tickers = mc_results  # Already sorted by confidence (list of dicts)
+    sharpe_ratios = {}  # Not used in simple ranking
     
     # Validate tickers and build top picks list
     logger.info(f"Validating top {MAX_POSITIONS} Monte Carlo picks against IBKR...")
     top_picks = []
     
-    for ticker in ranked_tickers:
+    for candidate in ranked_tickers:
         if len(top_picks) >= MAX_POSITIONS:
             break
         
-        candidate = next((rec for rec in buy_recommendations if rec['ticker'] == ticker), None)
-        if candidate:
-            if validate_ticker_in_ibkr(ticker):
-                candidate['sharpe_ratio'] = sharpe_ratios.get(ticker, 0.0)
-                top_picks.append(candidate)
-                logger.info(f"✅ Top pick #{len(top_picks)}: {ticker} (Sharpe: {candidate['sharpe_ratio']:.2f})")
-            else:
-                logger.warning(f"⚠️ Ticker {ticker} not found in IBKR. Skipping...")
+        ticker = candidate['ticker']
+        if validate_ticker_in_ibkr(ticker):
+            candidate['sharpe_ratio'] = sharpe_ratios.get(ticker, 0.0)
+            top_picks.append(candidate)
+            logger.info(f"[OK] Top pick #{len(top_picks)}: {ticker} (Sharpe: {candidate['sharpe_ratio']:.2f})")
+        else:
+            logger.warning(f"[WARNING] Ticker {ticker} not found in IBKR. Skipping...")
     
     if not top_picks:
         logger.error("No valid tickers found in Monte Carlo rankings.")

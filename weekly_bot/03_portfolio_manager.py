@@ -150,11 +150,16 @@ class PositionTracker:
         return self.positions
 
 
-def calculate_expected_return(sharpe_ratio):
-    """Convert Sharpe ratio to expected return estimate."""
-    risk_free_rate = 0.04
-    assumed_volatility = 0.15
-    return risk_free_rate + (sharpe_ratio * assumed_volatility)
+def calculate_expected_return(confidence):
+    """
+    Convert confidence score to expected return estimate.
+    Confidence of 0.85-0.95 maps to ~10-20% expected return.
+    """
+    # Map confidence (0.0-1.0) to expected return
+    # 0.75 confidence = 5% return, 0.95 confidence = 20% return
+    base_return = 0.02  # 2% base
+    confidence_premium = confidence * 0.20  # Up to 20% from confidence
+    return base_return + confidence_premium
 
 
 def should_rebalance(current_positions, top_picks):
@@ -163,7 +168,7 @@ def should_rebalance(current_positions, top_picks):
     Returns: (should_rebalance, current_return, optimized_return, improvement_pct)
     """
     if not current_positions:
-        logger.info("📊 No current positions. Will build portfolio from top picks.")
+        logger.info("[INFO] No current positions. Will build portfolio from top picks.")
         return (True, 0.0, 0.0, 0.0)
     
     # Calculate current portfolio expected return
@@ -174,33 +179,33 @@ def should_rebalance(current_positions, top_picks):
         symbol = pos.contract.symbol
         weight = pos.marketValue / total_value
         
-        # Find Sharpe ratio from top_picks
-        sharpe = next((pick['sharpe_ratio'] for pick in top_picks if pick['ticker'] == symbol), 0.0)
-        expected_return = calculate_expected_return(sharpe)
+        # Find confidence from top_picks (or use low default if not in list)
+        confidence = next((pick['confidence'] for pick in top_picks if pick['ticker'] == symbol), 0.50)
+        expected_return = calculate_expected_return(confidence)
         current_weighted_return += weight * expected_return
         
-        logger.info(f"   Current: {symbol} ({weight*100:.1f}% weight, Sharpe {sharpe:.2f}, Expected {expected_return*100:.1f}%)")
+        logger.info(f"   Current: {symbol} ({weight*100:.1f}% weight, Confidence {confidence:.2f}, Expected {expected_return*100:.1f}%)")
     
     # Calculate optimized portfolio return (top N equal-weighted)
     num_picks = min(len(top_picks), MAX_POSITIONS)
     if num_picks == 0:
-        logger.warning("⚠️ No top picks available. Cannot optimize.")
+        logger.warning("[WARNING] No top picks available. Cannot optimize.")
         return (False, current_weighted_return, 0.0, 0.0)
     
     optimized_return = 0.0
     for pick in top_picks[:num_picks]:
         weight = 1.0 / num_picks
-        sharpe = pick['sharpe_ratio']
-        expected_return = calculate_expected_return(sharpe)
+        confidence = pick['confidence']
+        expected_return = calculate_expected_return(confidence)
         optimized_return += weight * expected_return
         
-        logger.info(f"   Optimized: {pick['ticker']} ({weight*100:.1f}% weight, Sharpe {sharpe:.2f}, Expected {expected_return*100:.1f}%)")
+        logger.info(f"   Optimized: {pick['ticker']} ({weight*100:.1f}% weight, Confidence {confidence:.2f}, Expected {expected_return*100:.1f}%)")
     
     # Calculate improvement
     improvement = optimized_return - current_weighted_return
     improvement_pct = improvement / current_weighted_return if current_weighted_return > 0 else float('inf')
     
-    logger.info(f"📊 Portfolio Analysis:")
+    logger.info(f"[INFO] Portfolio Analysis:")
     logger.info(f"   Current Expected Return: {current_weighted_return*100:.2f}%")
     logger.info(f"   Optimized Expected Return: {optimized_return*100:.2f}%")
     logger.info(f"   Improvement: {improvement*100:.2f}% ({improvement_pct*100:.1f}%)")
@@ -209,7 +214,7 @@ def should_rebalance(current_positions, top_picks):
     should_reb = improvement_pct > REBALANCE_THRESHOLD
     
     if should_reb:
-        logger.info(f"✅ Improvement ({improvement_pct*100:.1f}%) exceeds threshold. REBALANCING.")
+        logger.info(f"[OK] Improvement ({improvement_pct*100:.1f}%) exceeds threshold. REBALANCING.")
     else:
         logger.info(f"🔒 Improvement ({improvement_pct*100:.1f}%) below threshold. HOLDING.")
     
@@ -257,7 +262,7 @@ def check_stops_and_exits(position_tracker):
                 if pos_data:
                     gain_pct = pos_data['current_return_pct'] * 100
                     trailing = "ACTIVE" if pos_data['trailing_stop_active'] else "NOT ACTIVE"
-                    logger.info(f"✅ HOLD: {symbol} @ ${current_price:.2f} ({gain_pct:+.1f}%, trailing: {trailing})")
+                    logger.info(f"[OK] HOLD: {symbol} @ ${current_price:.2f} ({gain_pct:+.1f}%, trailing: {trailing})")
         
         # Execute sell orders
         for symbol, contract, quantity, reason in positions_to_sell:
@@ -338,7 +343,7 @@ def execute_rebalance(top_picks, position_tracker):
                 
                 value_diff = target_value_per_position - current_value
                 if abs(value_diff) / target_value_per_position < 0.10:  # 10% tolerance
-                    logger.info(f"✅ {symbol} within tolerance")
+                    logger.info(f"[OK] {symbol} within tolerance")
                     continue
                 
                 num_shares = int(abs(value_diff) / current_price)
@@ -402,7 +407,7 @@ def execute_rebalance(top_picks, position_tracker):
                 ticker = trade_order['ticker']
                 
                 pos_data = position_tracker.add_position(ticker, entry_price, quantity)
-                logger.info(f"📊 Tracking {ticker}: Entry=${entry_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
+                logger.info(f"[INFO] Tracking {ticker}: Entry=${entry_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
             
             executed_trades.append(f"{trade_order['action']} {trade_order['quantity']} {trade_order['ticker']}")
         
@@ -419,10 +424,216 @@ def execute_rebalance(top_picks, position_tracker):
             ib.disconnect()
 
 
+def load_approved_trades():
+    """Load user-approved trades from reviewer."""
+    approved_file = "shared_state/approved_trades.json"
+    
+    if not os.path.exists(approved_file):
+        logger.error(f"No approved trades file found at {approved_file}")
+        logger.info("[ERROR] Please run portfolio_reviewer.py first to review and approve trades")
+        return None
+    
+    with open(approved_file, 'r') as f:
+        data = json.load(f)
+    
+    logger.info(f"Loaded {data['total_approved']} approved trades (from {data['total_proposed']} proposed)")
+    return data['approved_trades']
+
+
+def execute_approved_trades_only(approved_trades, position_tracker):
+    """Execute only user-approved trades."""
+    
+    if not approved_trades:
+        logger.info("No approved trades to execute")
+        return {"status": "SUCCESS", "reason": "No approved trades", "executed_trades": []}
+    
+    ib = IB()
+    
+    try:
+        logger.info("Connecting to IBKR for execution...")
+        ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
+        ib.reqMarketDataType(3)
+        
+        # FIXED CAPITAL ALLOCATION: Weekly bot uses ONLY $2000 budget
+        WEEKLY_BOT_BUDGET = 2000.00
+        
+        account_summary = ib.accountSummary()
+        
+        # Check both SettledCash (actual cash) and ExcessLiquidity (margin power)
+        settled_cash_data = next((v for v in account_summary if v.tag == 'SettledCash' and v.currency == 'USD'), None)
+        excess_liquidity_data = next((v for v in account_summary if v.tag == 'ExcessLiquidity' and v.currency == 'USD'), None)
+        
+        if not settled_cash_data or not excess_liquidity_data:
+            logger.error("Could not determine SettledCash or ExcessLiquidity.")
+            return {"status": "FAILURE", "reason": "Cash values not found"}
+        
+        settled_cash = float(settled_cash_data.value)
+        excess_liquidity = float(excess_liquidity_data.value)
+        
+        logger.info(f"SettledCash: ${settled_cash:,.2f}, ExcessLiquidity: ${excess_liquidity:,.2f}")
+        
+        # Use MINIMUM of: $2000 budget, settled cash, and excess liquidity
+        # This prevents order rejections due to insufficient settled cash
+        available_cash = min(WEEKLY_BOT_BUDGET, settled_cash, excess_liquidity)
+        logger.info(f"Weekly bot budget (capped at $2000, limited by SettledCash): ${available_cash:,.2f}")
+        
+        current_positions = ib.portfolio()
+        executed_trades = []
+        total_spent = 0.0
+        
+        # Calculate capital per buy (split available cash evenly across approved buys)
+        approved_buys = [t for t in approved_trades if t['action'] == 'BUY']
+        capital_per_buy = available_cash / len(approved_buys) if approved_buys else 0
+        
+        logger.info(f"Capital per buy (${available_cash:,.2f} / {len(approved_buys)} positions): ${capital_per_buy:,.2f}")
+        
+        # Helper function to check remaining cash
+        def get_remaining_cash():
+            """Get current settled cash available."""
+            ib.reqAccountSummary()
+            ib.sleep(0.5)
+            acct = ib.accountSummary()
+            cash_item = next((v for v in acct if v.tag == 'SettledCash' and v.currency == 'USD'), None)
+            return float(cash_item.value) if cash_item else 0.0
+        
+        # Process each approved trade
+        for approved in approved_trades:
+            action = approved['action']
+            symbol = approved['symbol']
+            
+            if action == "SELL":
+                # Find position
+                pos = next((p for p in current_positions if p.contract.symbol == symbol), None)
+                if not pos:
+                    logger.warning(f"Cannot sell {symbol} - no position found")
+                    continue
+                
+                quantity = int(abs(pos.position))
+                contract = pos.contract
+                
+                logger.info(f"Selling {quantity} {symbol}...")
+                order = Order(action="SELL", totalQuantity=quantity, orderType='MKT', outsideRth=True)
+                trade = ib.placeOrder(contract, order)
+                ib.sleep(2)
+                
+                position_tracker.remove_position(symbol)
+                executed_trades.append(f"SELL {quantity} {symbol}")
+                logger.info(f"[OK] Sold {quantity} {symbol}")
+            
+            elif action == "BUY":
+                logger.info(f"Fetching price for {symbol}...")
+                contract = Stock(symbol, 'SMART', 'USD')
+                
+                # Try to get market price with multiple fallbacks
+                ticker_data = ib.reqMktData(contract, '', True, False, [])
+                ib.sleep(2)
+                
+                price = ticker_data.marketPrice()
+                
+                # Fallback 1: Try last price if market price unavailable
+                if not (pd.notna(price) and price > 0):
+                    price = ticker_data.last
+                    if pd.notna(price) and price > 0:
+                        logger.info(f"Using last price for {symbol}: ${price:.2f}")
+                
+                # Fallback 2: Try close price
+                if not (pd.notna(price) and price > 0):
+                    price = ticker_data.close
+                    if pd.notna(price) and price > 0:
+                        logger.info(f"Using close price for {symbol}: ${price:.2f}")
+                
+                # Fallback 3: Use historical data
+                if not (pd.notna(price) and price > 0):
+                    logger.warning(f"Live price unavailable for {symbol}, trying historical data...")
+                    try:
+                        bars = ib.reqHistoricalData(
+                            contract,
+                            endDateTime='',
+                            durationStr='1 D',
+                            barSizeSetting='1 day',
+                            whatToShow='TRADES',
+                            useRTH=True
+                        )
+                        if bars:
+                            price = bars[-1].close
+                            logger.info(f"Using historical close price for {symbol}: ${price:.2f}")
+                    except Exception as e:
+                        logger.error(f"Failed to get historical data for {symbol}: {e}")
+                
+                # Execute if we have a valid price
+                if pd.notna(price) and price > 0:
+                    # Check remaining cash before attempting purchase
+                    remaining_cash = get_remaining_cash()
+                    estimated_cost = price * (capital_per_buy / price)  # Cost for this trade
+                    
+                    logger.info(f"Remaining SettledCash: ${remaining_cash:.2f}, Estimated cost: ${estimated_cost:.2f}")
+                    
+                    if remaining_cash < estimated_cost * 0.9:  # 10% buffer for slippage
+                        logger.warning(f"[SKIPPED] Insufficient SettledCash for {symbol} (${remaining_cash:.2f} < ${estimated_cost:.2f})")
+                        logger.info(f"   Cash will settle on Nov 6. Re-run portfolio manager then.")
+                        continue
+                    
+                    quantity = int(capital_per_buy / price)
+                    
+                    if quantity > 0:
+                        logger.info(f"Attempting to buy {quantity} {symbol} @ ${price:.2f} (${quantity * price:.2f} total)...")
+                        order = Order(action="BUY", totalQuantity=quantity, orderType='MKT', outsideRth=True)
+                        trade = ib.placeOrder(contract, order)
+                        ib.sleep(4)  # Wait longer for order status
+                        
+                        # Check if order was actually filled or rejected
+                        if trade.orderStatus.status in ['Filled']:
+                            fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus.avgFillPrice > 0 else price
+                            pos_data = position_tracker.add_position(symbol, fill_price, quantity)
+                            executed_trades.append(f"BUY {quantity} {symbol}")
+                            total_spent += quantity * fill_price
+                            logger.info(f"[OK] ✓ Bought {quantity} {symbol} @ ${fill_price:.2f} (Total spent: ${total_spent:.2f})")
+                            logger.info(f"   Tracking: Entry=${fill_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
+                        elif trade.orderStatus.status in ['PreSubmitted', 'Submitted']:
+                            # Order pending, assume it will fill
+                            logger.info(f"[PENDING] Order for {symbol} submitted, waiting for fill...")
+                            ib.sleep(2)
+                            if trade.orderStatus.status == 'Filled':
+                                fill_price = trade.orderStatus.avgFillPrice
+                                pos_data = position_tracker.add_position(symbol, fill_price, quantity)
+                                executed_trades.append(f"BUY {quantity} {symbol}")
+                                total_spent += quantity * fill_price
+                                logger.info(f"[OK] ✓ Bought {quantity} {symbol} @ ${fill_price:.2f} (Total spent: ${total_spent:.2f})")
+                            else:
+                                logger.warning(f"Order still pending for {symbol}: {trade.orderStatus.status}")
+                        elif trade.orderStatus.status in ['Cancelled', 'Inactive']:
+                            error_msg = trade.log[-1].message if trade.log else 'Unknown reason'
+                            logger.error(f"[FAILED] ✗ Order for {symbol} rejected: {error_msg}")
+                            if 'settled cash' in error_msg.lower():
+                                logger.info(f"   → Wait for cash settlement (Nov 6) and re-run")
+                        else:
+                            logger.warning(f"[UNKNOWN] Order status for {symbol}: {trade.orderStatus.status}")
+                    else:
+                        logger.warning(f"Quantity 0 for {symbol} - insufficient capital (${capital_per_buy:.2f} / ${price:.2f})")
+                else:
+                    logger.error(f"[SKIPPED] ✗ Cannot get valid price for {symbol} - all price sources failed")
+                    logger.info(f"   → Price may require live market data subscription")
+            
+            elif action == "HOLD":
+                logger.info(f"[OK] Holding {symbol} (user approved)")
+        
+        logger.info("Waiting for trades to settle...")
+        ib.sleep(10)
+        
+        return {"status": "SUCCESS", "executed_trades": executed_trades}
+    
+    except Exception as e:
+        logger.critical(f"Failed to execute trades: {e}", exc_info=True)
+        return {"status": "FAILURE", "reason": str(e), "executed_trades": []}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
 def main():
-    """Main execution for Phase 3: Portfolio Management"""
+    """Main execution for Phase 3: Portfolio Management (Approval-Based)"""
     logger.info("=" * 80)
-    logger.info("PHASE 3: PORTFOLIO MANAGER - Starting")
+    logger.info("PHASE 3: PORTFOLIO MANAGER - Starting (Approval-Based Mode)")
     logger.info("=" * 80)
     
     position_tracker = PositionTracker()
@@ -436,79 +647,40 @@ def main():
     else:
         logger.info("Market closed - skipping stop checks.")
     
-    # STEP 2: Read analysis results
-    phase_state = read_state('phase_state')
-    current_phase = phase_state.get('current_phase', 'unknown')
+    # STEP 2: Load approved trades from reviewer
+    approved_trades = load_approved_trades()
     
-    if current_phase != 'analysis_complete':
-        logger.error(f"Expected 'analysis_complete', got '{current_phase}'. Cannot proceed.")
+    if approved_trades is None:
+        logger.error("Cannot proceed without approved trades")
+        logger.info("[ERROR] Run portfolio_reviewer.py first to review and approve trades")
         sys.exit(1)
     
-    top_picks = phase_state.get('top_picks', [])
-    
-    if not top_picks:
-        logger.info("No top picks to evaluate. Ending cycle.")
+    if not approved_trades:
+        logger.info("[OK] No trades approved. Maintaining current portfolio.")
         write_state('phase_state', {
             'current_phase': 'execution_complete',
             'executed_trades': [],
-            'reason': 'No top picks from analysis',
+            'reason': 'No trades approved by user',
             'timestamp': datetime.now().isoformat()
         })
         sys.exit(0)
     
-    logger.info(f"Received {len(top_picks)} top picks: {[p['ticker'] for p in top_picks]}")
+    logger.info(f"Processing {len(approved_trades)} approved trades...")
     
-    # STEP 3: Portfolio optimization check
-    ib = IB()
-    try:
-        logger.info("Evaluating portfolio optimization...")
-        ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
-        ib.reqMarketDataType(3)
-        
-        current_positions = ib.portfolio()
-        logger.info(f"Current portfolio: {len(current_positions)} positions")
-        
-        should_reb, current_ret, optimized_ret, improvement = should_rebalance(current_positions, top_picks)
-        
-        if not should_reb:
-            logger.info("🔒 HOLDING - insufficient improvement to justify rebalancing.")
-            write_state('phase_state', {
-                'current_phase': 'execution_complete',
-                'executed_trades': [],
-                'reason': f'Held positions (improvement {improvement*100:.1f}% < threshold {REBALANCE_THRESHOLD*100:.1f}%)',
-                'timestamp': datetime.now().isoformat()
-            })
-            sys.exit(0)
-        
-        logger.info("✅ REBALANCING warranted - proceeding...")
-    
-    except Exception as e:
-        logger.error(f"Error during portfolio evaluation: {e}", exc_info=True)
-        write_state('phase_state', {
-            'current_phase': 'execution_complete',
-            'executed_trades': [],
-            'reason': f'Evaluation error: {str(e)}',
-            'timestamp': datetime.now().isoformat()
-        })
-        sys.exit(1)
-    finally:
-        if ib.isConnected():
-            ib.disconnect()
-    
-    # STEP 4: Execute rebalancing
+    # STEP 3: Check if market is open
     if not is_market_open():
         logger.warning("Market is closed. Cannot execute trades now.")
-        logger.info("TODO: Implement pre-market MOO order placement here")
         write_state('phase_state', {
-            'current_phase': 'execution_complete',
-            'executed_trades': [],
+            'current_phase': 'execution_pending',
             'reason': 'Market closed - trades deferred',
+            'approved_trades_pending': approved_trades,
             'timestamp': datetime.now().isoformat()
         })
         sys.exit(0)
     
-    logger.info("Market is open. Executing rebalance...")
-    trade_result = execute_rebalance(top_picks, position_tracker)
+    # STEP 4: Execute approved trades
+    logger.info("Market is open. Executing approved trades...")
+    trade_result = execute_approved_trades_only(approved_trades, position_tracker)
     
     logger.info(f"Rebalancing result: {trade_result.get('status')}")
     
