@@ -28,7 +28,7 @@ class BotSupervisor:
         self.sleeping = False
         
         # Schedule times (Pacific Time)
-        self.WAKE_HOUR = 5   # 5:00 AM PT = 8:00 AM ET (1.5 hours before market for full analysis)
+        self.WAKE_HOUR = 4   # 4:00 AM PT = 7:00 AM ET (START PRE-MARKET ANALYSIS - Phase 0-1.75 takes 2+ hours!)
         self.SLEEP_HOUR = 13  # 1:00 PM PT = 4:00 PM ET (market close)
         
     def start_exit_manager(self):
@@ -136,7 +136,7 @@ class BotSupervisor:
         now = datetime.now()
         current_hour = now.hour
         
-        # Market hours: 7 AM - 1 PM PT (10 AM - 4 PM ET)
+        # Pre-market + Market hours: 4 AM - 1 PM PT (7 AM - 4 PM ET)
         return self.WAKE_HOUR <= current_hour < self.SLEEP_HOUR
     
     def run(self):
@@ -144,7 +144,7 @@ class BotSupervisor:
         print("="*80)
         print("🤖 Trading Bot Supervisor (24/7 with Smart Scheduling)")
         print("="*80)
-        print(f"Wake time: {self.WAKE_HOUR}:00 AM PT (10:00 AM ET)")
+        print(f"Wake time: {self.WAKE_HOUR}:00 AM PT (7:00 AM ET - Pre-market analysis)")
         print(f"Sleep time: {self.SLEEP_HOUR}:00 PM PT (4:00 PM ET)")
         print("Press Ctrl+C to stop supervisor")
         print("="*80 + "\n")
@@ -173,10 +173,31 @@ class BotSupervisor:
                 self.sleeping = False
                 print("✅ Bots started successfully\n")
             else:
-                # Outside trading hours on startup
-                print(f"\n💤 Outside trading hours ({now.strftime('%H:%M:%S')}). Sleeping...")
-                print(f"Will auto-wake at {self.WAKE_HOUR}:00 AM PT\n")
-                self.sleeping = True
+                # Outside trading hours on startup - ASK USER
+                print(f"\n💤 Outside trading hours ({now.strftime('%H:%M:%S')})")
+                print(f"Scheduled wake time: {self.WAKE_HOUR}:00 AM PT")
+                
+                response = input("\nWould you like to start now? (Y/N): ").strip().upper()
+                
+                if response == 'Y':
+                    print("\n🚀 Starting bots immediately...")
+                    print("="*80)
+                    
+                    if not self.start_exit_manager():
+                        print("❌ Failed to start Exit Manager")
+                        return
+                    
+                    time.sleep(5)
+                    
+                    if not self.start_day_trader():
+                        print("⚠️  Failed to start Day Trader. Continuing with Exit Manager only.")
+                    
+                    self.sleeping = False
+                    print("✅ Bots started successfully\n")
+                else:
+                    print(f"\n💤 Sleeping until {self.WAKE_HOUR}:00 AM PT...")
+                    print("Supervisor will auto-wake at scheduled time\n")
+                    self.sleeping = True
             
             while self.running:
                 now = datetime.now()

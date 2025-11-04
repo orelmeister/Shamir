@@ -64,8 +64,9 @@ TRAILING_STOP_PCT = 0.10        # Trail 10% below peak price
 
 # Portfolio Settings
 INITIAL_CAPITAL = 2000          # Starting capital allocation
-MAX_POSITIONS = 5               # Maximum 5 concentrated positions
-POSITION_SIZE_PCT = 0.20        # 20% per position (1/5 of capital)
+MAX_POSITIONS = 5               # Maximum 5 positions for diversification
+POSITION_SIZE_PCT = 0.20        # 20% per position (equal weight across top 5)
+REBALANCE_THRESHOLD = 0.05      # Only rebalance if expected return improves by >5%
 
 # Time Rules
 MIN_HOLD_DAYS = 2               # Minimum hold to avoid day trading pattern
@@ -305,9 +306,17 @@ class DataAggregatorAgent(BaseAgent):
             news_items = polygon_data["news"]
             news_source = "Polygon"
         
-        # 2. Fallback to yfinance (only provides title + URL, no content)
+        # 2. Fallback to FMP (Financial Modeling Prep) - good for company press releases
         if not news_items:
-            self.log(logging.INFO, f"No news from Polygon for {ticker}. Trying yfinance.")
+            self.log(logging.INFO, f"No news from Polygon for {ticker}. Trying FMP.")
+            fmp_news_data = await self._fetch_fmp_news(session, ticker)
+            if fmp_news_data.get("news"):
+                news_items = fmp_news_data["news"]
+                news_source = "FMP"
+        
+        # 3. Final fallback to yfinance (only provides title + URL, no content)
+        if not news_items:
+            self.log(logging.INFO, f"No news from FMP for {ticker}. Trying yfinance.")
             yfinance_data = await self._fetch_yfinance_news(ticker)
             if yfinance_data.get("news"):
                 news_items = yfinance_data["news"]
@@ -404,6 +413,38 @@ class DataAggregatorAgent(BaseAgent):
             self.log(logging.ERROR, f"[Polygon] News error for {ticker}: {e}")
             return {"news": [], "error": str(e)}
 
+    async def _fetch_fmp_news(self, session, ticker):
+        """
+        Fetch news from FMP (Financial Modeling Prep) API.
+        Uses stock_news endpoint which provides comprehensive news with full text content.
+        """
+        url = f"https://financialmodelingprep.com/api/v3/stock_news"
+        params = {
+            "tickers": ticker,
+            "limit": NEWS_FETCH_LIMIT,
+            "apikey": FMP_API_KEY
+        }
+        try:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                # FMP provides text (full content), title, publishedDate, site, and url
+                news_items = [
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("text", ""),  # FMP's full text content
+                        "published_date": item.get("publishedDate", ""),
+                        "site": item.get("site", "")
+                    } 
+                    for item in data
+                ]
+                self.log(logging.DEBUG, f"[FMP] Fetched {len(news_items)} news items for {ticker}.")
+                return {"news": news_items}
+        except Exception as e:
+            self.log(logging.ERROR, f"[FMP] News error for {ticker}: {e}")
+            return {"news": [], "error": str(e)}
+
     async def _fetch_yfinance_news(self, ticker):
         try:
             loop = asyncio.get_event_loop()
@@ -482,46 +523,54 @@ class AnalystAgent(BaseAgent):
             self.orchestrator.write_to_queue({"phase": "analysis_complete", "recommendations": []})
             return
 
-        self.log(logging.INFO, "Running Monte Carlo simulation to find the top pick...")
-        top_pick_ticker_list = mc.run_monte_carlo_filter(buy_recommendations)
+        self.log(logging.INFO, "Running Monte Carlo simulation to rank stocks...")
+        mc_results = mc.run_monte_carlo_filter(buy_recommendations)
         
-        if not top_pick_ticker_list:
-            self.log(logging.ERROR, "Monte Carlo simulation failed to return a top pick.")
+        if not mc_results or not mc_results.get("ranked_tickers"):
+            self.log(logging.ERROR, "Monte Carlo simulation failed to return rankings.")
             self.orchestrator.write_to_queue({"phase": "analysis_complete", "recommendations": []})
             return
         
-        # Validate tickers in ranked order and select first valid one
-        top_pick = None
-        for ticker in top_pick_ticker_list:
+        ranked_tickers = mc_results["ranked_tickers"]
+        sharpe_ratios = mc_results["sharpe_ratios"]
+        
+        # Validate tickers and build top 5 list
+        top_picks = []
+        for ticker in ranked_tickers:
+            if len(top_picks) >= MAX_POSITIONS:
+                break
+                
             candidate = next((rec for rec in buy_recommendations if rec['ticker'] == ticker), None)
             if candidate:
                 # Quick validation: check if ticker exists in IBKR
                 if self._validate_ticker_in_ibkr(ticker):
-                    top_pick = candidate
-                    self.log(logging.INFO, f"✅ Selected valid ticker: {ticker}")
-                    break
+                    candidate['sharpe_ratio'] = sharpe_ratios.get(ticker, 0.0)
+                    top_picks.append(candidate)
+                    self.log(logging.INFO, f"✅ Added to top 5: {ticker} (Sharpe: {candidate['sharpe_ratio']:.2f})")
                 else:
                     self.log(logging.WARNING, f"⚠️ Ticker {ticker} not found in IBKR. Trying next...")
         
-        if not top_pick:
+        if not top_picks:
             self.log(logging.ERROR, "No valid tickers found in Monte Carlo rankings.")
             self.orchestrator.write_to_queue({"phase": "analysis_complete", "recommendations": []})
             return
 
-        self.log(logging.INFO, f"Top pick from Monte Carlo is: {top_pick['ticker']}")
+        self.log(logging.INFO, f"Top {len(top_picks)} picks from Monte Carlo: {[p['ticker'] for p in top_picks]}")
         self.orchestrator.write_to_queue({
             "phase": "analysis_complete",
-            "recommendation": top_pick
+            "top_picks": top_picks  # Changed from single recommendation to list
         })
         self.log(logging.INFO, "--- Finished. Top recommendation sent to queue. ---")
 
     def _validate_ticker_in_ibkr(self, ticker):
-        """Quick validation to check if ticker exists in IBKR before trading."""
+        """Quick validation to check if ticker exists in IBKR before trading (Python 3.12+ compatible)."""
+        import ib_insync.util as ib_util
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=1)
+            # Use ib_insync.util.run() for Python 3.12+ compatibility
+            ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
             contract = Stock(ticker, 'SMART', 'USD')
-            details = ib.reqContractDetails(contract)
+            details = ib_util.run(ib.reqContractDetailsAsync(contract))
             ib.disconnect()
             
             if not details:
@@ -743,14 +792,88 @@ class PortfolioManagerAgent(BaseAgent):
         super().__init__(orchestrator, agent_name)
         self.position_tracker = PositionTracker()
     
+    def _calculate_expected_return(self, sharpe_ratio):
+        """
+        Convert Sharpe ratio to expected return estimate.
+        Simple linear approximation: higher Sharpe = higher expected return.
+        This is a rough proxy since we don't have full volatility data.
+        """
+        # Assume risk-free rate ~4% annually, market volatility ~15%
+        # Expected Return ≈ Risk-Free Rate + Sharpe × Volatility
+        risk_free_rate = 0.04
+        assumed_volatility = 0.15
+        return risk_free_rate + (sharpe_ratio * assumed_volatility)
+    
+    def _should_rebalance(self, current_positions, top_picks):
+        """
+        Determine if rebalancing is warranted based on 5% improvement threshold.
+        
+        Returns: (should_rebalance: bool, current_return: float, optimized_return: float, improvement: float)
+        """
+        # Calculate current portfolio expected return
+        if not current_positions:
+            # No positions = definitely rebalance to top picks
+            self.log(logging.INFO, "📊 No current positions. Will build portfolio from top picks.")
+            return (True, 0.0, 0.0, 0.0)
+        
+        # Get current portfolio weights and Sharpe ratios
+        total_value = sum(pos.marketValue for pos in current_positions)
+        current_weighted_return = 0.0
+        
+        for pos in current_positions:
+            symbol = pos.contract.symbol
+            weight = pos.marketValue / total_value
+            
+            # Find Sharpe ratio from top_picks (if symbol is in top picks)
+            sharpe = next((pick['sharpe_ratio'] for pick in top_picks if pick['ticker'] == symbol), 0.0)
+            expected_return = self._calculate_expected_return(sharpe)
+            current_weighted_return += weight * expected_return
+            
+            self.log(logging.INFO, f"   Current: {symbol} ({weight*100:.1f}% weight, Sharpe {sharpe:.2f}, Expected Return {expected_return*100:.1f}%)")
+        
+        # Calculate optimized portfolio expected return (top 5 equal-weighted)
+        num_picks = min(len(top_picks), MAX_POSITIONS)
+        if num_picks == 0:
+            self.log(logging.WARNING, "⚠️ No top picks available. Cannot optimize.")
+            return (False, current_weighted_return, 0.0, 0.0)
+        
+        optimized_return = 0.0
+        for i, pick in enumerate(top_picks[:num_picks]):
+            weight = 1.0 / num_picks  # Equal weighting
+            sharpe = pick['sharpe_ratio']
+            expected_return = self._calculate_expected_return(sharpe)
+            optimized_return += weight * expected_return
+            
+            self.log(logging.INFO, f"   Optimized: {pick['ticker']} ({weight*100:.1f}% weight, Sharpe {sharpe:.2f}, Expected Return {expected_return*100:.1f}%)")
+        
+        # Calculate improvement
+        improvement = optimized_return - current_weighted_return
+        improvement_pct = improvement / current_weighted_return if current_weighted_return > 0 else float('inf')
+        
+        self.log(logging.INFO, f"📊 Portfolio Analysis:")
+        self.log(logging.INFO, f"   Current Expected Return: {current_weighted_return*100:.2f}%")
+        self.log(logging.INFO, f"   Optimized Expected Return: {optimized_return*100:.2f}%")
+        self.log(logging.INFO, f"   Improvement: {improvement*100:.2f}% ({improvement_pct*100:.1f}%)")
+        self.log(logging.INFO, f"   Threshold: {REBALANCE_THRESHOLD*100:.1f}%")
+        
+        should_rebalance = improvement_pct > REBALANCE_THRESHOLD
+        
+        if should_rebalance:
+            self.log(logging.INFO, f"✅ Improvement ({improvement_pct*100:.1f}%) exceeds threshold ({REBALANCE_THRESHOLD*100:.1f}%). REBALANCING.")
+        else:
+            self.log(logging.INFO, f"🔒 Improvement ({improvement_pct*100:.1f}%) below threshold ({REBALANCE_THRESHOLD*100:.1f}%). HOLDING CURRENT POSITIONS.")
+        
+        return (should_rebalance, current_weighted_return, optimized_return, improvement_pct)
+    
     def execute(self):
-        self.log(logging.INFO, "--- [PHASE 3] Starting trade execution with growth strategy. ---")
+        self.log(logging.INFO, "--- [PHASE 3] Starting portfolio optimization with 5% threshold. ---")
         
         # STEP 1: Check stop losses and trailing stops FIRST
         if is_market_open():
             self._check_stops_and_exits()
         else:
             self.log(logging.INFO, "Market closed - skipping stop loss checks until market opens.")
+        
         queue_data = self.orchestrator.read_from_queue()
 
         if queue_data.get("phase") != "analysis_complete":
@@ -758,13 +881,50 @@ class PortfolioManagerAgent(BaseAgent):
             self.orchestrator.halt_cycle()
             return
 
-        recommendation = queue_data.get("recommendation")
-        if not recommendation or recommendation.get("decision") != "BUY":
-            self.log(logging.INFO, "No 'BUY' recommendation to execute. Ending cycle.")
+        top_picks = queue_data.get("top_picks", [])
+        if not top_picks:
+            self.log(logging.INFO, "No top picks to evaluate. Ending cycle.")
             self.orchestrator.write_to_queue({"phase": "execution_complete", "executed_trades": []})
             return
-
-        # If market is closed, try to place pre-market orders or wait for market open
+        
+        self.log(logging.INFO, f"Received {len(top_picks)} top picks from Monte Carlo: {[p['ticker'] for p in top_picks]}")
+        
+        # STEP 2: Portfolio optimization - compare current vs optimized
+        ib = IB()
+        try:
+            self.log(logging.INFO, "Connecting to IBKR for portfolio evaluation...")
+            # Python 3.12+ async compatibility fix
+            import ib_insync.util as ib_util
+            ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
+            ib.reqMarketDataType(3)
+            
+            current_positions = ib.portfolio()
+            self.log(logging.INFO, f"Current portfolio: {len(current_positions)} positions")
+            
+            # Check if rebalancing is warranted
+            should_rebalance, current_return, optimized_return, improvement = self._should_rebalance(current_positions, top_picks)
+            
+            if not should_rebalance:
+                self.log(logging.INFO, "🔒 HOLDING current positions - insufficient improvement to justify rebalancing.")
+                self.orchestrator.write_to_queue({
+                    "phase": "execution_complete",
+                    "executed_trades": [],
+                    "reason": f"Held positions (improvement {improvement*100:.1f}% < threshold {REBALANCE_THRESHOLD*100:.1f}%)"
+                })
+                return
+            
+            # STEP 3: Rebalancing is warranted - proceed with trades
+            self.log(logging.INFO, "✅ REBALANCING to top 5 equal-weighted positions...")
+            
+        except Exception as e:
+            self.log(logging.ERROR, f"Error during portfolio evaluation: {e}", exc_info=True)
+            self.orchestrator.write_to_queue({"phase": "execution_complete", "executed_trades": []})
+            return
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+        
+        # STEP 4: Execute rebalancing with market timing logic
         if not is_market_open():
             # Check current time in ET timezone
             ny_tz = pytz.timezone('America/New_York')
@@ -773,7 +933,7 @@ class PortfolioManagerAgent(BaseAgent):
             
             # Try to place pre-market orders (will check time window internally)
             self.log(logging.INFO, "Market is currently closed. Attempting pre-market order placement...")
-            trade_result = self._place_moo_orders(recommendation)
+            trade_result = self._place_moo_orders_for_top_picks(top_picks)
             
             # Check if we were outside the safe window
             if trade_result.get('status') == 'OUTSIDE_WINDOW':
@@ -787,14 +947,14 @@ class PortfolioManagerAgent(BaseAgent):
                     import time
                     time.sleep(time_until_open + 5)  # Wait 5 sec after open
                     self.log(logging.INFO, "✅ Market now open. Placing LIMIT orders.")
-                    trade_result = self._execute_rebalance(recommendation)
+                    trade_result = self._execute_rebalance_to_top_picks(top_picks)
                 elif time_until_open > 300:
                     self.log(logging.ERROR, f"Market opens in {time_until_open/60:.1f} minutes. Too long to wait. Exiting.")
                     trade_result = {"status": "FAILURE", "reason": "Too early to place orders"}
                 else:
                     # Market already opened (time_until_open <= 0)
                     self.log(logging.INFO, "Market already open. Placing LIMIT orders now.")
-                    trade_result = self._execute_rebalance(recommendation)
+                    trade_result = self._execute_rebalance_to_top_picks(top_picks)
             
             # Handle any other failures
             elif trade_result.get('status') in ['FAILURE', 'MOO_REJECTED']:
@@ -806,10 +966,10 @@ class PortfolioManagerAgent(BaseAgent):
                     self.log(logging.INFO, f"Waiting {time_until_open:.0f} seconds for market open...")
                     import time
                     time.sleep(time_until_open + 5)
-                    trade_result = self._execute_rebalance(recommendation)
+                    trade_result = self._execute_rebalance_to_top_picks(top_picks)
                 elif time_until_open <= 0:
                     self.log(logging.INFO, "Market already open. Executing now.")
-                    trade_result = self._execute_rebalance(recommendation)
+                    trade_result = self._execute_rebalance_to_top_picks(top_picks)
                 else:
                     self.log(logging.ERROR, "Cannot place orders - too early and pre-market failed.")
             
@@ -819,17 +979,17 @@ class PortfolioManagerAgent(BaseAgent):
             })
             return
 
-        self.log(logging.INFO, f"Received 'BUY' recommendation for {recommendation['ticker']}. Initiating portfolio rebalance.")
+        self.log(logging.INFO, f"Market is open. Rebalancing to top {min(len(top_picks), MAX_POSITIONS)} picks...")
         
-        trade_result = self._execute_rebalance(recommendation)
+        trade_result = self._execute_rebalance_to_top_picks(top_picks)
         
         self.log(logging.INFO, f"Rebalancing result: {trade_result.get('status', 'UNKNOWN')}")
         
         self.orchestrator.write_to_queue({
             "phase": "execution_complete",
-            "executed_trades": trade_result if trade_result.get('status') != "FAILURE" else []
+            "executed_trades": trade_result.get('executed_trades', []) if trade_result.get('status') != "FAILURE" else []
         })
-        self.log(logging.INFO, f"--- Finished. Rebalancing for {recommendation['ticker']} processed. ---")
+        self.log(logging.INFO, f"--- Finished. Portfolio optimized to top {min(len(top_picks), MAX_POSITIONS)} positions. ---")
 
     def _check_stops_and_exits(self):
         """
@@ -840,7 +1000,9 @@ class PortfolioManagerAgent(BaseAgent):
         
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=1)
+            # Python 3.12+ async compatibility fix
+            import ib_insync.util as ib_util
+            ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
             ib.reqMarketDataType(3)
             
             current_positions = ib.portfolio()
@@ -904,7 +1066,9 @@ class PortfolioManagerAgent(BaseAgent):
         
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=1)
+            # Python 3.12+ async compatibility fix
+            import ib_insync.util as ib_util
+            ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
             ib.reqMarketDataType(3)
             
             current_positions = ib.portfolio()
@@ -1087,13 +1251,173 @@ class PortfolioManagerAgent(BaseAgent):
         finally:
             if ib.isConnected():
                 ib.disconnect()
+    
+    def _place_moo_orders_for_top_picks(self, top_picks):
+        """
+        Place pre-market orders for top N picks (equal weight allocation).
+        Uses MKT orders that execute at market open (9:30 AM ET).
+        Only places orders if we're in the safe window (9:00-9:27 AM ET).
+        """
+        # CRITICAL: Check if we're in the safe time window for pre-market orders
+        ny_tz = pytz.timezone('America/New_York')
+        now_ny = datetime.now(ny_tz)
+        current_time = now_ny.time()
+        
+        # Safe window: 9:00-9:27 AM ET
+        window_start = datetime.strptime("09:00", "%H:%M").time()
+        window_end = datetime.strptime("09:27", "%H:%M").time()
+        
+        if not (window_start <= current_time <= window_end):
+            self.log(logging.WARNING, f"⏰ Outside safe pre-market window (9:00-9:27 AM ET). Current time: {now_ny.strftime('%H:%M:%S')} ET")
+            return {"status": "OUTSIDE_WINDOW", "reason": f"Current time {now_ny.strftime('%H:%M:%S')} ET outside 9:00-9:27 AM window", "moo_orders": []}
+        
+        self.log(logging.INFO, f"✅ Within safe pre-market window: {now_ny.strftime('%H:%M:%S')} ET (9:00-9:27 AM)")
+        self.log(logging.INFO, "=== Placing Pre-Market Orders for Top Picks ===")
+        
+        ib = IB()
+        try:
+            self.log(logging.INFO, "Connecting to IBKR for pre-market order placement...")
+            util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
+            ib.reqMarketDataType(3)
+            
+            account_summary = ib.accountSummary()
+            portfolio_value_data = next((v for v in account_summary if v.tag == 'NetLiquidation' and v.currency == 'USD'), None)
+            
+            if not portfolio_value_data:
+                self.log(logging.ERROR, "Could not determine Net Liquidation from IBKR.")
+                return {"status": "FAILURE", "reason": "NetLiquidation not found."}
 
-    def _execute_rebalance(self, recommendation):
+            total_portfolio_value = float(portfolio_value_data.value)
+            current_positions = ib.portfolio()
+            
+            # Target: top N picks equal-weighted
+            target_tickers = [pick['ticker'] for pick in top_picks[:MAX_POSITIONS]]
+            num_target_positions = len(target_tickers)
+            target_value_per_position = total_portfolio_value / num_target_positions
+            
+            self.log(logging.INFO, f"Portfolio Value: ${total_portfolio_value:,.2f}")
+            self.log(logging.INFO, f"Target: {num_target_positions} stocks @ ${target_value_per_position:,.2f} each")
+            self.log(logging.INFO, f"Target tickers: {target_tickers}")
+            
+            moo_orders_placed = []
+            
+            # STEP 1: Sell positions not in target
+            for pos in current_positions:
+                symbol = pos.contract.symbol
+                if symbol not in target_tickers:
+                    quantity = int(abs(pos.position))
+                    contract = Stock(symbol, 'SMART', 'USD')
+                    order = Order(
+                        action='SELL',
+                        totalQuantity=quantity,
+                        orderType='MKT',
+                        tif='DAY',
+                        outsideRth=True,
+                        transmit=True
+                    )
+                    trade = ib.placeOrder(contract, order)
+                    ib.sleep(1)
+                    
+                    if trade.orderStatus.status != 'Cancelled':
+                        self.log(logging.INFO, f"🔻 SELL {quantity} {symbol} (not in top {MAX_POSITIONS})")
+                        moo_orders_placed.append(f"SELL {quantity} {symbol}")
+                        self.position_tracker.remove_position(symbol)
+                    else:
+                        self.log(logging.ERROR, f"❌ Order rejected for {symbol}")
+            
+            # STEP 2: Adjust positions in target portfolio
+            current_symbols = {pos.contract.symbol for pos in current_positions}
+            for pos in current_positions:
+                symbol = pos.contract.symbol
+                if symbol in target_tickers:
+                    current_value = pos.marketValue
+                    current_price = pos.marketPrice
+                    
+                    if current_price <= 0:
+                        continue
+                    
+                    value_diff = target_value_per_position - current_value
+                    if abs(value_diff) / target_value_per_position < 0.10:
+                        self.log(logging.INFO, f"✅ {symbol} within tolerance")
+                        continue
+                    
+                    num_shares = int(abs(value_diff) / current_price)
+                    action = "BUY" if value_diff > 0 else "SELL"
+                    
+                    if num_shares > 0:
+                        contract = Stock(symbol, 'SMART', 'USD')
+                        order = Order(
+                            action=action,
+                            totalQuantity=num_shares,
+                            orderType='MKT',
+                            tif='DAY',
+                            outsideRth=True,
+                            transmit=True
+                        )
+                        trade = ib.placeOrder(contract, order)
+                        ib.sleep(1)
+                        
+                        if trade.orderStatus.status != 'Cancelled':
+                            self.log(logging.INFO, f"{'📈' if action=='BUY' else '📉'} {action} {num_shares} {symbol}")
+                            moo_orders_placed.append(f"{action} {num_shares} {symbol}")
+            
+            # STEP 3: Buy new positions
+            for ticker in target_tickers:
+                if ticker not in current_symbols:
+                    contract = Stock(ticker, 'SMART', 'USD')
+                    ticker_data = ib.reqMktData(contract, '', True, False, [])
+                    ib.sleep(2)
+                    
+                    price_estimate = ticker_data.close
+                    if pd.notna(price_estimate) and price_estimate > 0:
+                        quantity = int(target_value_per_position / price_estimate)
+                        
+                        if quantity > 0:
+                            order = Order(
+                                action='BUY',
+                                totalQuantity=quantity,
+                                orderType='MKT',
+                                tif='DAY',
+                                outsideRth=True,
+                                transmit=True
+                            )
+                            trade = ib.placeOrder(contract, order)
+                            ib.sleep(1)
+                            
+                            if trade.orderStatus.status != 'Cancelled':
+                                self.log(logging.INFO, f"🆕 BUY {quantity} {ticker} @ ~${price_estimate:.2f}")
+                                moo_orders_placed.append(f"BUY {quantity} {ticker}")
+                                
+                                # Add position tracking
+                                pos_data = self.position_tracker.add_position(ticker, price_estimate, quantity)
+                                self.log(logging.INFO, f"📊 Tracking: Entry=${price_estimate:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
+            
+            if not moo_orders_placed:
+                self.log(logging.INFO, "Portfolio already balanced. No pre-market orders needed.")
+                return {"status": "SUCCESS", "reason": "Already balanced.", "moo_orders": []}
+            
+            self.log(logging.INFO, f"✅ Placed {len(moo_orders_placed)} pre-market orders.")
+            return {"status": "SUCCESS_MOO", "moo_orders": moo_orders_placed}
+        
+        except Exception as e:
+            self.log(logging.CRITICAL, f"Failed to place pre-market orders: {e}", exc_info=True)
+            return {"status": "FAILURE", "reason": str(e), "moo_orders": []}
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    def _execute_rebalance_to_top_picks(self, top_picks):
+        """
+        Rebalance portfolio to equal weight across top N picks (up to MAX_POSITIONS).
+        Sells positions not in top picks, adjusts sizes for positions in top picks.
+        """
         ib = IB()
         try:
             self.log(logging.INFO, "Connecting to IBKR for portfolio rebalancing...")
-            ib.connect(IB_HOST, IB_PORT, clientId=1)
-            ib.reqMarketDataType(3) # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed/Frozen
+            # Python 3.12+ async compatibility fix
+            import ib_insync.util as ib_util
+            ib_util.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=1))
+            ib.reqMarketDataType(3)
             self.log(logging.INFO, "Set market data type to Delayed (3).")
             
             account_summary = ib.accountSummary()
@@ -1108,106 +1432,119 @@ class PortfolioManagerAgent(BaseAgent):
             self.log(logging.INFO, f"Total Portfolio Value: ${total_portfolio_value:,.2f}")
             self.log(logging.INFO, f"Found {len(current_positions)} existing positions.")
 
-            target_portfolio_symbols = {pos.contract.symbol for pos in current_positions}
-            new_ticker = recommendation['ticker']
-            
-            # CHECK POSITION LIMIT BEFORE ADDING NEW POSITION
-            if new_ticker not in target_portfolio_symbols:
-                if len(current_positions) >= MAX_POSITIONS:
-                    self.log(logging.WARNING, f"🚫 POSITION LIMIT REACHED: Already have {len(current_positions)} positions (max: {MAX_POSITIONS}). Cannot add {new_ticker}.")
-                    self.log(logging.INFO, f"Recommendation for {new_ticker} will be skipped. Consider selling a position first.")
-                    return {"status": "LIMIT_REACHED", "reason": f"Max {MAX_POSITIONS} positions already held."}
-            
-            target_portfolio_symbols.add(new_ticker)
-            
-            num_target_positions = len(target_portfolio_symbols)
-            if num_target_positions == 0:
-                self.log(logging.WARNING, "No target positions to rebalance.")
-                return {"status": "SUCCESS", "reason": "No positions to rebalance."}
-
+            # Target portfolio: top N picks (up to MAX_POSITIONS)
+            target_tickers = [pick['ticker'] for pick in top_picks[:MAX_POSITIONS]]
+            num_target_positions = len(target_tickers)
             target_value_per_position = total_portfolio_value / num_target_positions
-            self.log(logging.INFO, f"Target portfolio: {num_target_positions} stocks, each with a target value of ${target_value_per_position:,.2f}.")
+            
+            self.log(logging.INFO, f"Target portfolio: {num_target_positions} stocks (equal weight ${target_value_per_position:,.2f} each)")
+            self.log(logging.INFO, f"Target tickers: {target_tickers}")
 
             trades_to_make = []
             
+            # STEP 1: Sell positions not in target portfolio
             for pos in current_positions:
-                symbol, current_value, current_price = pos.contract.symbol, pos.marketValue, pos.marketPrice
-                self.log(logging.INFO, f"Evaluating existing position: {symbol}, Value: ${current_value:,.2f}, Price: ${current_price:,.2f}")
-
-                if current_price <= 0:
-                    self.log(logging.WARNING, f"Market price for {symbol} is invalid ({current_price}). Skipping rebalance for this stock.")
-                    continue
-
-                value_diff = target_value_per_position - current_value
-                if abs(value_diff) / target_value_per_position < 0.10: # 10% tolerance
-                    self.log(logging.INFO, f"Position {symbol} is within 10% tolerance. No trade needed.")
-                    continue
-
-                num_shares_to_trade = abs(value_diff) / current_price
-                action = "BUY" if value_diff > 0 else "SELL"
-                if num_shares_to_trade > 0:
-                    trades_to_make.append({"action": action, "ticker": symbol, "quantity": int(num_shares_to_trade)})
-
-            if new_ticker not in [pos.contract.symbol for pos in current_positions]:
-                self.log(logging.INFO, f"Fetching market price for new stock: {new_ticker}")
-                new_stock_contract = Stock(new_ticker, 'SMART', 'USD')
-                ticker_data = ib.reqMktData(new_stock_contract, '', True, False, [])
-                ib.sleep(2)
-
-                new_stock_price = ticker_data.marketPrice()
-                if pd.notna(new_stock_price) and new_stock_price > 0:
-                    self.log(logging.INFO, f"Market price for {new_ticker} is ${new_stock_price:,.2f}")
-                    quantity_to_buy = int(target_value_per_position / new_stock_price)
-                    if quantity_to_buy > 0:
-                        trades_to_make.append({
-                            "action": "BUY", 
-                            "ticker": new_ticker, 
-                            "quantity": quantity_to_buy,
-                            "price": new_stock_price  # Store price for position tracking
-                        })
-                else:
-                    self.log(logging.ERROR, f"Could not get valid market price for {new_ticker}. Skipping trade.")
-
-            if not trades_to_make:
-                self.log(logging.INFO, "Portfolio is already balanced. No trades needed.")
-                return {"status": "SUCCESS", "reason": "Portfolio already balanced."}
-
-            self.log(logging.INFO, f"Rebalancing plan: {trades_to_make}")
+                symbol = pos.contract.symbol
+                if symbol not in target_tickers:
+                    quantity = int(abs(pos.position))
+                    self.log(logging.INFO, f"🔻 {symbol} not in top {MAX_POSITIONS} - selling {quantity} shares")
+                    trades_to_make.append({"action": "SELL", "ticker": symbol, "quantity": quantity})
+                    
+                    # Remove from position tracking
+                    self.position_tracker.remove_position(symbol)
             
+            # STEP 2: Adjust sizes for positions in target portfolio
+            for pos in current_positions:
+                symbol = pos.contract.symbol
+                if symbol in target_tickers:
+                    current_value = pos.marketValue
+                    current_price = pos.marketPrice
+                    
+                    if current_price <= 0:
+                        self.log(logging.WARNING, f"Invalid price for {symbol}: {current_price}. Skipping.")
+                        continue
+                    
+                    value_diff = target_value_per_position - current_value
+                    if abs(value_diff) / target_value_per_position < 0.10:  # 10% tolerance
+                        self.log(logging.INFO, f"✅ {symbol} within tolerance (${current_value:,.2f} vs ${target_value_per_position:,.2f})")
+                        continue
+                    
+                    num_shares_to_trade = abs(value_diff) / current_price
+                    action = "BUY" if value_diff > 0 else "SELL"
+                    if num_shares_to_trade > 0:
+                        self.log(logging.INFO, f"{'📈' if action=='BUY' else '📉'} {symbol}: {action} {int(num_shares_to_trade)} shares (adjust to ${target_value_per_position:,.2f})")
+                        trades_to_make.append({
+                            "action": action,
+                            "ticker": symbol,
+                            "quantity": int(num_shares_to_trade),
+                            "price": current_price if action == "BUY" else None
+                        })
+            
+            # STEP 3: Buy new positions not currently held
+            current_symbols = {pos.contract.symbol for pos in current_positions}
+            for ticker in target_tickers:
+                if ticker not in current_symbols:
+                    self.log(logging.INFO, f"Fetching market price for new stock: {ticker}")
+                    contract = Stock(ticker, 'SMART', 'USD')
+                    ticker_data = ib.reqMktData(contract, '', True, False, [])
+                    ib.sleep(2)
+                    
+                    price = ticker_data.marketPrice()
+                    if pd.notna(price) and price > 0:
+                        quantity = int(target_value_per_position / price)
+                        if quantity > 0:
+                            self.log(logging.INFO, f"🆕 {ticker}: BUY {quantity} shares @ ${price:.2f} (new position)")
+                            trades_to_make.append({
+                                "action": "BUY",
+                                "ticker": ticker,
+                                "quantity": quantity,
+                                "price": price
+                            })
+                    else:
+                        self.log(logging.ERROR, f"Invalid price for {ticker}: {price}. Skipping.")
+            
+            if not trades_to_make:
+                self.log(logging.INFO, "Portfolio already matches target allocation. No trades needed.")
+                return {"status": "SUCCESS", "reason": "Already optimized."}
+            
+            # STEP 4: Execute all trades
+            self.log(logging.INFO, f"Executing {len(trades_to_make)} trades...")
             executed_trades_info = []
+            
             for trade_order in trades_to_make:
                 contract = Stock(trade_order['ticker'], 'SMART', 'USD')
                 order = Order(
-                    action=trade_order['action'], 
-                    totalQuantity=trade_order['quantity'], 
+                    action=trade_order['action'],
+                    totalQuantity=trade_order['quantity'],
                     orderType='MKT',
-                    outsideRth=True  # Allow filling outside regular trading hours
+                    outsideRth=True
                 )
                 trade = ib.placeOrder(contract, order)
-                self.log(logging.INFO, f"Placed {trade_order['action']} order for {trade_order['quantity']} of {trade_order['ticker']} (eligible for after-hours).")
+                self.log(logging.INFO, f"Placed {trade_order['action']} order for {trade_order['quantity']} of {trade_order['ticker']}")
                 
-                # ADD POSITION TRACKING FOR NEW BUYS
+                # Add position tracking for new buys
                 if trade_order['action'] == 'BUY' and 'price' in trade_order:
                     entry_price = trade_order['price']
                     quantity = trade_order['quantity']
                     ticker = trade_order['ticker']
                     
                     pos_data = self.position_tracker.add_position(ticker, entry_price, quantity)
-                    self.log(logging.INFO, f"📊 Position tracking started for {ticker}: Entry=${entry_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f} (-10%)")
+                    self.log(logging.INFO, f"📊 Position tracking: {ticker} Entry=${entry_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
                 
                 executed_trades_info.append(f"{trade_order['action']} {trade_order['quantity']} {trade_order['ticker']}")
             
             self.log(logging.INFO, "Waiting for trades to settle...")
-            ib.sleep(15) 
-
+            ib.sleep(15)
+            
             return {"status": "SUCCESS_REBALANCE", "executed_trades": executed_trades_info}
-
+        
         except Exception as e:
-            self.log(logging.CRITICAL, f"Failed to execute rebalancing via IBKR: {e}", exc_info=True)
+            self.log(logging.CRITICAL, f"Failed to execute rebalancing: {e}", exc_info=True)
             return {"status": "FAILURE", "reason": str(e)}
         finally:
             if ib.isConnected():
                 self.log(logging.INFO, "Disconnecting from Interactive Brokers.")
+                ib.disconnect()
                 ib.disconnect()
 
 # --- Agent 4: Monitoring ---
