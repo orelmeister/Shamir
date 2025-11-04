@@ -175,11 +175,11 @@ class DayTraderOrchestrator:
             return None
         
         try:
-            # Create reports folder
-            os.makedirs("day_trader_reports", exist_ok=True)
+            # Create reports folder (already in .gitignore)
+            os.makedirs("reports/day_trader", exist_ok=True)
             
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"day_trader_reports/momentum_analysis_{timestamp}_iter{iteration}.pdf"
+            filename = f"reports/day_trader/momentum_analysis_{timestamp}_iter{iteration}.pdf"
             
             # Create PDF
             doc = SimpleDocTemplate(filename, pagesize=letter)

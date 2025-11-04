@@ -195,8 +195,8 @@ def generate_pdf_report(
         logger.warning("reportlab not available. Skipping PDF generation.")
         return None
     
-    # Create proposed_trades directory
-    pdf_dir = "proposed_trades"
+    # Create reports directory (already in .gitignore)
+    pdf_dir = "reports/weekly_bot"
     os.makedirs(pdf_dir, exist_ok=True)
     
     # Generate filename
