@@ -219,7 +219,7 @@ class DataAggregatorAgent(BaseDayTraderAgent):
         filtered = []
         
         # Use ThreadPoolExecutor for parallel yfinance calls (blocking I/O)
-        max_workers = 15  # Optimal from testing (5-30 range tested)
+        max_workers = 100  # High concurrency for I/O-bound yfinance API calls
         
         def calculate_atr_for_ticker(ticker):
             """Calculate ATR for a single ticker"""
@@ -573,8 +573,10 @@ class WatchlistAnalystAgent(BaseDayTraderAgent):
         self.log(logging.INFO, f"Analyzing {len(market_data)} stocks in parallel using LLM.")
 
         candidates = []
-        # Use a ThreadPoolExecutor to run analyses in parallel
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        # Use a ThreadPoolExecutor to run analyses in parallel (100 threads for fast LLM API calls)
+        MAX_WORKERS = 100
+        self.log(logging.INFO, f"Using {MAX_WORKERS} parallel threads for LLM analysis...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # Create a future for each stock analysis
             future_to_stock = {executor.submit(self._get_day_trading_analysis, stock_data): stock_data for stock_data in market_data}
             
@@ -640,13 +642,14 @@ class ATRPredictorAgent(BaseDayTraderAgent):
             List of stocks with predicted ATR > 1.5%, sorted by confidence
         """
         self.log(logging.INFO, f"--- [PHASE 0.5] ATR Prediction for {len(market_data)} stocks ---")
-        self.log(logging.INFO, f"Analyzing {len(market_data)} stocks in parallel with 15 workers...")
         
         predictions = []
         processed_count = 0
         
-        # Use parallel processing for speed
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        # Use parallel processing for speed (100 threads for fast API/data processing)
+        MAX_WORKERS = 100
+        self.log(logging.INFO, f"Analyzing {len(market_data)} stocks in parallel with {MAX_WORKERS} workers...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_ticker = {
                 executor.submit(self._predict_atr, stock): stock['ticker'] 
                 for stock in market_data

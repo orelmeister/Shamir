@@ -11,6 +11,7 @@ from polygon import RESTClient
 import pandas as pd
 import pandas_ta as ta
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
@@ -81,7 +82,9 @@ class PolygonIntradayScanner:
         from_date = start_time.strftime('%Y-%m-%d')
         to_date = end_time.strftime('%Y-%m-%d')
         
-        for ticker in stock_tickers:
+        # Worker function for parallel processing
+        def analyze_ticker(ticker):
+            """Analyze a single ticker for momentum"""
             try:
                 # Get 1-minute aggregates for last 30 minutes
                 aggs = self.polygon.get_aggs(
@@ -94,7 +97,7 @@ class PolygonIntradayScanner:
                 )
                 
                 if not aggs or len(aggs) < 10:
-                    continue
+                    return None
                 
                 # Convert to DataFrame
                 df = pd.DataFrame([{
@@ -114,7 +117,7 @@ class PolygonIntradayScanner:
                 # Calculate ATR for volatility
                 atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
                 if atr_series is None or len(atr_series) == 0 or pd.isna(atr_series.iloc[-1]):
-                    continue
+                    return None
                 
                 atr = atr_series.iloc[-1]
                 atr_pct = (atr / current_price) * 100
@@ -123,20 +126,41 @@ class PolygonIntradayScanner:
                 if volume_30min > 50000 and abs(price_change_pct) > 0.5 and atr_pct > 0.3:
                     momentum_score = abs(price_change_pct) * (volume_30min / 50000)
                     
-                    movers.append({
+                    result = {
                         'ticker': ticker,
                         'price': current_price,
                         'volume_30min': int(volume_30min),
                         'price_change_pct': round(price_change_pct, 2),
                         'atr_pct': round(atr_pct, 2),
                         'momentum_score': round(momentum_score, 2)
-                    })
+                    }
                     
                     logger.info(f"✅ {ticker}: {price_change_pct:+.2f}% on {volume_30min:,} vol")
+                    return result
+                
+                return None
             
             except Exception as e:
                 logger.debug(f"⚠️ {ticker}: {str(e)}")
-                continue
+                return None
+        
+        # Parallel processing with 50 threads (fast I/O for Polygon API)
+        MAX_WORKERS = 50
+        logger.info(f"Using {MAX_WORKERS} parallel threads for scanning...")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all ticker analyses
+            future_to_ticker = {executor.submit(analyze_ticker, ticker): ticker for ticker in stock_tickers}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    result = future.result()
+                    if result:
+                        movers.append(result)
+                except Exception as e:
+                    logger.debug(f"❌ Error processing {ticker}: {e}")
         
         # Sort by momentum score (highest first)
         movers.sort(key=lambda x: x['momentum_score'], reverse=True)
