@@ -7,9 +7,10 @@ __pycache__/
 # Virtual environment
 venv/
 .venv/
+.venv-daytrader/
+.venv-weekly/
 env/
 ENV/
-.venv-daytrader/
 
 # Secrets and credentials
 .env
