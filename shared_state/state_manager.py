@@ -214,7 +214,18 @@ class StateManager:
         lock = filelock.FileLock(PHASE_LOCK, timeout=LOCK_TIMEOUT)
         try:
             with lock:
-                state = self.get_phase_state()
+                # Read state directly (don't call self.get_phase_state() - would deadlock!)
+                if not PHASE_FILE.exists():
+                    state = {
+                        "current_phase": "idle",
+                        "phase_history": [],
+                        "last_error": None,
+                        "halt_requested": False,
+                        "last_updated": datetime.now().isoformat()
+                    }
+                else:
+                    with open(PHASE_FILE, "r") as f:
+                        state = json.load(f)
                 
                 # Add to history
                 history_entry = {
@@ -279,3 +290,66 @@ def get_phase_state():
 def update_phase_state(current_phase, status, error=None):
     """Update phase state (convenience function)"""
     _state_manager.update_phase_state(current_phase, status, error)
+
+# Generic read/write functions for backward compatibility
+def read_state(filename):
+    """
+    Generic read function for state files.
+    Args:
+        filename: 'phase_state', 'positions_state', or 'orders_state'
+    Returns:
+        dict: State data
+    """
+    if filename == 'phase_state':
+        return get_phase_state()
+    elif filename == 'positions_state':
+        positions = get_positions()
+        return {'positions': positions, 'last_updated': datetime.now().isoformat()}
+    elif filename == 'orders_state':
+        orders = get_orders()
+        return {'orders': orders, 'last_updated': datetime.now().isoformat()}
+    else:
+        raise ValueError(f"Unknown state file: {filename}")
+
+def write_state(filename, data):
+    """
+    Generic write function for state files.
+    Args:
+        filename: 'phase_state', 'positions_state', or 'orders_state'
+        data: dict with state data (for phase_state, can include custom keys like stocks_for_analysis)
+    """
+    if filename == 'phase_state':
+        # For phase_state, write custom data directly (like stocks_for_analysis)
+        lock = filelock.FileLock(PHASE_LOCK, timeout=LOCK_TIMEOUT)
+        try:
+            with lock:
+                # Read existing state to preserve history
+                if PHASE_FILE.exists():
+                    with open(PHASE_FILE, "r") as f:
+                        state = json.load(f)
+                else:
+                    state = {
+                        "current_phase": "idle",
+                        "phase_history": [],
+                        "last_error": None,
+                        "halt_requested": False
+                    }
+                
+                # Merge new data (allows custom keys like stocks_for_analysis)
+                state.update(data)
+                state["last_updated"] = datetime.now().isoformat()
+                
+                # Backup and write
+                _state_manager._backup_file(PHASE_FILE)
+                with open(PHASE_FILE, "w") as f:
+                    json.dump(state, f, indent=2)
+        except filelock.Timeout:
+            raise RuntimeError(f"Failed to acquire lock on {PHASE_FILE} (timeout)")
+    elif filename == 'positions_state':
+        positions = data.get('positions', [])
+        update_positions(positions)
+    elif filename == 'orders_state':
+        orders = data.get('orders', [])
+        update_orders(orders)
+    else:
+        raise ValueError(f"Unknown state file: {filename}")

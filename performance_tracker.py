@@ -11,7 +11,7 @@ from pathlib import Path
 class PerformanceTracker:
     """Tracks and stores trading performance in SQLite database"""
     
-    def __init__(self, db_path="trading_performance.db"):
+    def __init__(self, db_path="databases/trading_performance.db"):
         self.db_path = db_path
         self._init_database()
     

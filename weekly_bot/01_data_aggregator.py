@@ -27,7 +27,7 @@ import yfinance as yf
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Local imports
-from shared_state.state_manager import StateManager, update_phase_state
+from shared_state.state_manager import StateManager, update_phase_state, write_state
 
 # --- Configuration ---
 load_dotenv()
@@ -87,9 +87,9 @@ class DataAggregator:
                 ticker = stock.get("ticker", "Unknown")
                 if revenue_growth >= MIN_REVENUE_GROWTH:
                     filtered_data.append(stock)
-                    logger.debug(f"✅ {ticker}: {revenue_growth*100:.1f}% CAGR")
+                    logger.debug(f"[OK] {ticker}: {revenue_growth*100:.1f}% CAGR")
                 else:
-                    logger.debug(f"❌ {ticker}: {revenue_growth*100:.1f}% < {MIN_REVENUE_GROWTH*100:.0f}%")
+                    logger.debug(f"[ERROR] {ticker}: {revenue_growth*100:.1f}% < {MIN_REVENUE_GROWTH*100:.0f}%")
             
             logger.info(f"Pre-LLM filter: {len(aggregated_data)} stocks -> {len(filtered_data)} stocks (passed revenue growth filter)")
             aggregated_data = filtered_data
@@ -103,15 +103,19 @@ class DataAggregator:
             try:
                 with open(OUTPUT_FILE, 'w') as f:
                     json.dump(aggregated_data, f, indent=4)
-                logger.info(f"✅ Saved aggregated data for {len(aggregated_data)} tickers to {OUTPUT_FILE}")
+                logger.info(f"[OK] Saved aggregated data for {len(aggregated_data)} tickers to {OUTPUT_FILE}")
             except Exception as e:
                 logger.error(f"Failed to save aggregated data file: {e}")
                 update_phase_state("aggregation", "failed", error=str(e))
                 sys.exit(1)
             
-            # Update phase state
-            update_phase_state("aggregation", "completed")
-            logger.info(f"✅ Phase 1 complete: {len(aggregated_data)} stocks ready for analysis")
+            # Update phase state with stock data for Phase 2
+            write_state('phase_state', {
+                'current_phase': 'aggregation_complete',
+                'stocks_for_analysis': aggregated_data,
+                'timestamp': datetime.now().isoformat()
+            })
+            logger.info(f"[OK] Phase 1 complete: {len(aggregated_data)} stocks passed to Analyst via phase_state")
             
         except Exception as e:
             logger.critical(f"Critical error during data aggregation: {e}", exc_info=True)
@@ -152,6 +156,7 @@ class DataAggregator:
                 "marketCapMoreThan": MARKET_CAP_MIN,
                 "marketCapLowerThan": MARKET_CAP_MAX,
                 "priceMoreThan": 1,
+                "priceLowerThan": 10,  # MAX $10 for $2000 portfolio (4-5 positions @ $500 each = 50+ shares min)
                 "volumeMoreThan": 50000,
                 "isEtf": "false",
                 "isFund": "false",

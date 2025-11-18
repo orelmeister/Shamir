@@ -97,7 +97,7 @@ def initialize_state():
     logger.info("Initialized phase state")
 
 
-def get_phase_state():
+def get_phase_state_data():
     """Read current phase state."""
     return read_state('phase_state')
 
@@ -148,7 +148,7 @@ def main():
             sys.exit(1)
         
         # Set phase state to aggregation_complete
-        phase_data = get_phase_state()
+        phase_data = get_phase_state_data()
         # Load stocks from full_market_data.json
         with open('full_market_data.json', 'r') as f:
             market_data = json.load(f)
@@ -170,7 +170,7 @@ def main():
         # Rebalance only
         logger.info("Selected: Rebalance Only")
         # Check if analysis results exist
-        phase_data = get_phase_state()
+        phase_data = get_phase_state_data()
         if phase_data.get('current_phase') != 'analysis_complete':
             logger.error("❌ No analysis results found. Cannot rebalance.")
             logger.error("Please run Analysis first (Option 3).")

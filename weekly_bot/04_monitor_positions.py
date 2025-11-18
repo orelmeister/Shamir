@@ -113,7 +113,7 @@ def monitor_positions(position_tracker, duration_minutes=None):
                     if pos_data:
                         gain_pct = pos_data['current_return_pct'] * 100
                         trailing_status = "ACTIVE" if pos_data['trailing_stop_active'] else "NOT ACTIVE"
-                        logger.info(f"✅ {symbol}: ${current_price:.2f} ({gain_pct:+.1f}%, trailing: {trailing_status})")
+                        logger.info(f"[OK] {symbol}: ${current_price:.2f} ({gain_pct:+.1f}%, trailing: {trailing_status})")
             
             # Execute sell orders for stopped positions
             for symbol, contract, quantity, reason in positions_to_sell:
@@ -121,7 +121,7 @@ def monitor_positions(position_tracker, duration_minutes=None):
                 order = Order(action="SELL", totalQuantity=abs(quantity), orderType='MKT', outsideRth=True)
                 trade = ib.placeOrder(contract, order)
                 ib.sleep(2)
-                logger.info(f"✅ Sell order placed for {symbol}")
+                logger.info(f"[OK] Sell order placed for {symbol}")
                 
                 # Remove from tracking
                 position_tracker.remove_position(symbol)
@@ -133,7 +133,7 @@ def monitor_positions(position_tracker, duration_minutes=None):
                     write_state('positions_state', positions_data)
             
             if positions_to_sell:
-                logger.info(f"⚠️ Sold {len(positions_to_sell)} position(s) due to stops.")
+                logger.info(f"[WARNING] Sold {len(positions_to_sell)} position(s) due to stops.")
             
         except Exception as e:
             logger.error(f"Error during monitoring check: {e}", exc_info=True)

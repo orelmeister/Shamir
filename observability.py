@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class TradingDatabase:
     """SQLite database for storing all trading operations and metrics"""
     
-    def __init__(self, db_path: str = "trading_history.db"):
+    def __init__(self, db_path: str = "databases/trading_history.db"):
         self.db_path = db_path
         self._init_database()
         self._optimize_database()
