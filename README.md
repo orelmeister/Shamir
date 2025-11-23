@@ -685,6 +685,37 @@ See `STRATEGY_CHANGES.md` for complete evolution history. trading_history.db # S
 
 
 
+## 📊 Analysis Tools
+
+### Position Analysis Tool
+
+**Quickly analyze your current IBKR positions vs entry data:**
+
+```bash
+# Run full analysis (requires IBKR connection)
+python analyze_positions.py
+
+# Or use the launcher script
+./analyze_positions.bat  # Windows
+```
+
+**What it shows:**
+- Current position details (quantity, price, market value)
+- Entry data from database (entry price, date, quantity)
+- Profit/Loss calculations (database entry vs IBKR average cost)
+- Performance metrics (price change %, unrealized P&L)
+- Profit targets and stop losses (if tracked by exit manager)
+- Account summary (net liquidation, available funds)
+
+**Verify database queries (no IBKR needed):**
+```bash
+python verify_position_database.py
+```
+
+See `README_POSITION_ANALYSIS.md` for complete documentation.
+
+---
+
 ## 📞 Support & Documentation logs/ # Daily run logs
 
  day_trader_run_*.json
@@ -697,7 +728,9 @@ See `STRATEGY_CHANGES.md` for complete evolution history. trading_history.db # S
 
 - **Pre-Trading Checklist**: `PRE_TRADING_CHECKLIST.md`
 
-- **Task Scheduling**: `TASK_SCHEDULER_SETUP.md` archive/ # Archived old files
+- **Task Scheduling**: `TASK_SCHEDULER_SETUP.md`
+
+- **Position Analysis**: `README_POSITION_ANALYSIS.md` archive/ # Archived old files
 
  old_tests/
 
