@@ -1131,30 +1131,58 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.log(logging.INFO, f"✅ Already connected to IBKR from pre-market phase. Account: {self.ib.managedAccounts()}")
             return
         
+        # Wait a moment for IBKR to fully initialize (especially important for scheduled tasks)
+        self.log(logging.INFO, "Waiting 5 seconds for IBKR Gateway/TWS to be ready...")
+        time.sleep(5)
+        
         # Create new connection with retry logic
         self.ib = IB()
         
         # Connection parameters
         port = 4001 if self.paper_trade else 4001
         client_id = 2  # Use same ID as pre-market phase to avoid conflicts
-        max_retries = 3
-        retry_delay = 5  # seconds
+        max_retries = 5  # Increased from 3 for scheduled task reliability
+        retry_delay = 10  # Increased to 10 seconds for IBKR to stabilize
         
         for attempt in range(1, max_retries + 1):
             try:
                 self.log(logging.INFO, f"Connection attempt {attempt}/{max_retries} to 127.0.0.1:{port} with clientId={client_id}...")
                 
-                # Python 3.12 fix: Ensure event loop exists before connecting
+                # Disconnect any existing connection first
+                if self.ib.isConnected():
+                    self.log(logging.INFO, "Disconnecting existing connection before retry...")
+                    self.ib.disconnect()
+                    time.sleep(2)  # Wait for clean disconnect
+                
+                # Python 3.12 + Scheduled Task fix: Force new event loop
                 import asyncio
                 import ib_insync.util as ib_util
-                try:
-                    asyncio.get_event_loop()
-                except RuntimeError:
-                    # Create new event loop if none exists
-                    asyncio.set_event_loop(asyncio.new_event_loop())
                 
-                # Increase timeout to 10 seconds (from default 4)
-                ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id, timeout=10))
+                # Always create fresh event loop for scheduled tasks
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        raise RuntimeError("Loop is closed")
+                except (RuntimeError, AttributeError):
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    self.log(logging.INFO, "Created new event loop for scheduled task context")
+                
+                # Try synchronous connect first (more reliable for scheduled tasks)
+                try:
+                    self.ib.connect('127.0.0.1', port, clientId=client_id, timeout=20)
+                    if self.ib.isConnected():
+                        self.log(logging.INFO, f"✅ Successfully connected via sync method. Account: {self.ib.managedAccounts()}")
+                        return  # Success!
+                except Exception as sync_error:
+                    self.log(logging.WARNING, f"Sync connect failed: {sync_error}, trying async...")
+                    
+                    # Fall back to async connect
+                    if self.ib.isConnected():
+                        self.ib.disconnect()
+                        time.sleep(2)
+                    
+                    ib_util.run(self.ib.connectAsync('127.0.0.1', port, clientId=client_id, timeout=20))
                 
                 # Verify connection
                 if not self.ib.isConnected():
@@ -1164,7 +1192,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                 return  # Success!
                 
             except Exception as e:
-                self.log(logging.ERROR, f"Connection attempt {attempt}/{max_retries} failed: {e}")
+                self.log(logging.ERROR, f"Connection attempt {attempt}/{max_retries} failed: {str(e)[:200]}")
                 
                 if attempt < max_retries:
                     self.log(logging.INFO, f"Retrying in {retry_delay} seconds...")
