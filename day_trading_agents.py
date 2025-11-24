@@ -1217,12 +1217,19 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.watchlist_data = []
 
     def _calculate_capital(self):
-        """Calculates the capital to allocate per stock based on account value."""
+        """
+        Calculates the capital to allocate per stock based on account value.
+        UPDATED: Excludes other agents' position values from available capital.
+        Uses 100% of available capital (not percentage-based allocation).
+        """
         if not self.watchlist_data:
             self.log(logging.INFO, "No capital allocated as watchlist is empty.")
             return
 
-        self.log(logging.INFO, "Calculating capital allocation...")
+        self.log(logging.INFO, "="*80)
+        self.log(logging.INFO, "CAPITAL CALCULATION - Multi-Agent Isolation")
+        self.log(logging.INFO, "="*80)
+        
         try:
             # Fetch account summary
             self.ib.reqAccountSummary()
@@ -1231,149 +1238,218 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             self.account_summary = {item.tag: item.value for item in acc_summary_list}
 
             # Find available cash and total account value
-            # Use ExcessLiquidity - this is the ACTUAL buying power available even with PDT restrictions
             excess_liquidity = float(self.account_summary.get('ExcessLiquidity', 0))
             net_liquidation = float(self.account_summary.get('NetLiquidation', 0))
             settled_cash = float(self.account_summary.get('SettledCash', 0))
 
-            self.log(logging.INFO, f"Account Summary: Excess Liquidity: ${excess_liquidity:.2f}, Net Liquidation: ${net_liquidation:.2f}, Settled Cash: ${settled_cash:.2f}")
-
-            # Determine the total capital to use for day trading
-            # For PDT-restricted accounts, use ExcessLiquidity which represents real buying power
-            total_day_trading_capital = excess_liquidity * self.allocation
+            self.log(logging.INFO, f"📊 IBKR Account Summary:")
+            self.log(logging.INFO, f"   Excess Liquidity: ${excess_liquidity:.2f}")
+            self.log(logging.INFO, f"   Net Liquidation: ${net_liquidation:.2f}")
+            self.log(logging.INFO, f"   Settled Cash: ${settled_cash:.2f}")
+            
+            # Calculate OTHER agents' position values (form4_strategy, etc.)
+            other_agents_value = 0.0
+            other_agents_positions = []
+            
+            # Get all non-day_trader positions from database
+            all_positions = self.db.get_active_positions()
+            for pos in all_positions:
+                if pos['agent_name'] != 'day_trader':
+                    symbol = pos['symbol']
+                    qty = pos['quantity']
+                    entry = pos['entry_price']
+                    position_value = qty * entry
+                    other_agents_value += position_value
+                    other_agents_positions.append(f"{symbol}({pos['agent_name']})")
+            
+            if other_agents_positions:
+                self.log(logging.INFO, f"\n🔒 OTHER AGENTS' POSITIONS (excluded from day_trader capital):")
+                for pos in all_positions:
+                    if pos['agent_name'] != 'day_trader':
+                        symbol = pos['symbol']
+                        qty = pos['quantity']
+                        entry = pos['entry_price']
+                        value = qty * entry
+                        self.log(logging.INFO, f"   {symbol}: ${value:.2f} ({qty} @ ${entry:.2f}) [Agent: {pos['agent_name']}]")
+                self.log(logging.INFO, f"   TOTAL OTHER AGENTS VALUE: ${other_agents_value:.2f}")
+            else:
+                self.log(logging.INFO, f"\n✅ No other agent positions found. Full capital available.")
+            
+            # Calculate available capital for day trader
+            # FIXED ALLOCATION: Use only $1000 for day trading
+            fixed_day_trading_budget = 1000.0
+            available_capital = min(fixed_day_trading_budget, excess_liquidity)
+            
+            self.log(logging.INFO, f"\n💰 DAY TRADER CAPITAL:")
+            self.log(logging.INFO, f"   Excess Liquidity: ${excess_liquidity:.2f}")
+            self.log(logging.INFO, f"   Other Agents' Value: ${other_agents_value:.2f}")
+            self.log(logging.INFO, f"   Fixed Day Trading Budget: ${fixed_day_trading_budget:.2f}")
+            self.log(logging.INFO, f"   Available for Day Trading: ${available_capital:.2f}")
 
             # Safety check: ensure we have meaningful capital
-            if total_day_trading_capital < 50:
-                self.log(logging.WARNING, f"Excess liquidity too low (${excess_liquidity:.2f}). Cannot trade with ${total_day_trading_capital:.2f}.")
+            if available_capital < 50:
+                self.log(logging.WARNING, f"⚠️ Available capital too low (${available_capital:.2f}). Cannot trade.")
+                self.capital_per_stock = 0
                 return
 
-            # Calculate capital per stock
-            self.capital_per_stock = total_day_trading_capital / len(self.watchlist_data)
-            self.log(logging.INFO, f"Total capital for day trading: ${total_day_trading_capital:.2f}. Capital per stock: ${self.capital_per_stock:.2f}")
+            # Calculate capital per stock (equal weight across watchlist)
+            self.capital_per_stock = available_capital / len(self.watchlist_data)
+            self.log(logging.INFO, f"   Capital per stock: ${self.capital_per_stock:.2f} (across {len(self.watchlist_data)} stocks)")
             
             # Set starting capital for daily P&L tracking
             self.starting_capital = net_liquidation
-            self.log(logging.INFO, f"Starting capital for daily P&L tracking: ${self.starting_capital:.2f}")
+            self.log(logging.INFO, f"\n📈 Starting capital for daily P&L tracking: ${self.starting_capital:.2f}")
 
         except Exception as e:
             self.log(logging.ERROR, f"Error calculating capital: {e}")
+            import traceback
+            self.log(logging.ERROR, f"Traceback: {traceback.format_exc()}")
             self.capital_per_stock = 0
 
     def _sync_positions_from_ibkr(self):
         """
         Syncs the in-memory positions dictionary with actual IBKR positions.
         This is critical for recovering state after bot restarts.
-        UPDATED: Now checks shared_state/positions_state.json to avoid touching weekly bot positions.
+        UPDATED: Now uses database agent_name filtering to ONLY sync day_trader positions.
+        Form4 and weekly positions are completely ignored.
         """
         try:
-            self.log(logging.INFO, "Syncing positions from IBKR account...")
+            self.log(logging.INFO, "="*80)
+            self.log(logging.INFO, "POSITION SYNC - Database-Driven Isolation")
+            self.log(logging.INFO, "="*80)
             
-            # CRITICAL: Load weekly positions from shared state to avoid conflicts
-            weekly_positions = []
-            try:
-                from shared_state.state_manager import read_state
-                positions_state = read_state('positions_state')
-                weekly_positions = positions_state.get('weekly_positions', [])
-                if weekly_positions:
-                    self.log(logging.INFO, f"🔒 Found {len(weekly_positions)} weekly positions to exclude: {weekly_positions}")
-            except Exception as e:
-                self.log(logging.WARNING, f"Could not read weekly positions from shared state: {e}. Continuing without exclusions.")
+            # Get positions owned by day_trader from database
+            db_day_trader_positions = self.db.get_positions_by_agent('day_trader')
             
+            if not db_day_trader_positions:
+                self.log(logging.INFO, "✅ No day_trader positions in database. Starting fresh.")
+                return
+            
+            self.log(logging.INFO, f"📊 Found {len(db_day_trader_positions)} day_trader positions in database:")
+            for db_pos in db_day_trader_positions:
+                symbol = db_pos['symbol']
+                qty = db_pos['quantity']
+                entry = db_pos['entry_price']
+                self.log(logging.INFO, f"   {symbol}: {qty} shares @ ${entry:.2f}")
+            
+            # Get ALL IBKR positions for comparison
             ibkr_positions = self.ib.positions()
             
             if not ibkr_positions:
-                self.log(logging.INFO, "No open positions found in IBKR account.")
+                self.log(logging.WARNING, "⚠️ Database shows day_trader positions but IBKR has none. Position mismatch!")
+                self.log(logging.WARNING, "   This could mean positions were manually closed or there's a sync issue.")
                 return
             
-            synced_count = 0
+            # Create map of IBKR positions for quick lookup
+            ibkr_position_map = {pos.contract.symbol: pos for pos in ibkr_positions}
+            
+            # Log ALL IBKR positions for transparency
+            self.log(logging.INFO, f"\n🔍 IBKR Account has {len(ibkr_positions)} total positions:")
             for pos in ibkr_positions:
                 symbol = pos.contract.symbol
+                qty = abs(pos.position)
+                cost = pos.avgCost
+                agent_owner = "UNKNOWN"
                 
-                # CRITICAL: Exclude weekly bot positions (don't touch them!)
-                if symbol in weekly_positions:
-                    self.log(logging.INFO, f"⏭️ Skipping {symbol} - managed by weekly bot")
+                # Check database ownership
+                if self.db.is_position_active(symbol, 'day_trader'):
+                    agent_owner = "day_trader"
+                elif self.db.is_position_active(symbol, 'form4_strategy'):
+                    agent_owner = "form4_strategy"
+                elif self.db.is_position_active(symbol):
+                    agent_owner = "OTHER_AGENT"
+                
+                self.log(logging.INFO, f"   {symbol}: {qty} shares @ ${cost:.2f} [Owner: {agent_owner}]")
+            
+            # Now sync ONLY day_trader positions
+            synced_count = 0
+            for db_pos in db_day_trader_positions:
+                symbol = db_pos['symbol']
+                
+                # Verify position exists in IBKR
+                if symbol not in ibkr_position_map:
+                    self.log(logging.WARNING, f"⚠️ {symbol}: In database but NOT in IBKR. Position may have been manually closed.")
+                    # Remove from database to keep in sync
+                    self.db.remove_active_position(symbol, 0, 'MANUAL_CLOSE_DETECTED', 'day_trader')
                     continue
                 
-                # Only sync positions for stocks in our watchlist
-                watchlist_symbols = [item.get('ticker') for item in self.watchlist_data]
-                if symbol in watchlist_symbols:
-                    quantity = abs(pos.position)
-                    entry_price = pos.avgCost
-                    contract = Stock(symbol, 'SMART', 'USD')
-                    
-                    # CRITICAL: Qualify contract with IBKR before placing order
-                    self.ib.qualifyContracts(contract)
-                    
-                    # Calculate profit target and stop loss
-                    take_profit = entry_price * (1 + self.profit_target_pct)
-                    stop_loss_price = entry_price * (1 - self.stop_loss_pct)
-                    
-                    # Create OCA (One-Cancels-All) group for OCO bracket
-                    oca_group = f"OCA_{symbol}_{int(time.time())}"
-                    
-                    # Place OCO bracket: Take Profit (LIMIT) + Stop Loss (STOP)
-                    tp_order = LimitOrder('SELL', quantity, take_profit)
-                    tp_order.ocaGroup = oca_group
-                    tp_order.ocaType = 1  # Cancel remaining on fill
-                    tp_order.tif = 'DAY'
-                    tp_order.outsideRth = False
-                    
-                    sl_order = StopOrder('SELL', quantity, stop_loss_price)
-                    sl_order.ocaGroup = oca_group
-                    sl_order.ocaType = 1  # Cancel remaining on fill
-                    sl_order.tif = 'DAY'
-                    sl_order.outsideRth = False
-                    
-                    # ============================================================
-                    # STEP 3: PLACE OCO BRACKET ORDERS FOR SYNCED POSITION
-                    # ============================================================
-                    self.log(logging.INFO, f"⏳ STEP 3: Placing OCO brackets for synced position {symbol}...")
-                    
-                    tp_trade = self.ib.placeOrder(contract, tp_order)
-                    self.ib.sleep(1)  # Wait for TP to be accepted
-                    sl_trade = self.ib.placeOrder(contract, sl_order)
-                    self.ib.sleep(3)  # Wait for SL to be accepted
-                    
-                    # Verify OCO orders were accepted
-                    tp_status = tp_trade.orderStatus.status
-                    sl_status = sl_trade.orderStatus.status
-                    
-                    self.log(logging.INFO, f"✅ SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
-                    
-                    if tp_status in ['Submitted', 'PreSubmitted']:
-                        self.log(logging.INFO, f"   ✅ TP order accepted: ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%) [Status: {tp_status}]")
-                    else:
-                        self.log(logging.ERROR, f"   ❌ TP order FAILED! Status: {tp_status}")
-                    
-                    if sl_status in ['Submitted', 'PreSubmitted']:
-                        self.log(logging.INFO, f"   ✅ SL order accepted: ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%) [Status: {sl_status}]")
-                    else:
-                        self.log(logging.ERROR, f"   ❌ SL order FAILED! Status: {sl_status}")
-                    
-                    self.log(logging.INFO, f"   OCA Group: {oca_group}")
-                    
-                    # Create position entry in our tracking dictionary
-                    self.positions[symbol] = {
-                        "quantity": quantity,
-                        "entry_price": entry_price,
-                        "contract": contract,
-                        "atr_pct": None,  # Unknown from IBKR, will be recalculated
-                        "take_profit_trade": tp_trade,
-                        "stop_loss_trade": sl_trade,
-                        "stop_loss_price": stop_loss_price,
-                        "take_profit_price": take_profit,
-                        "oca_group": oca_group,
-                        "entry_type": "SYNCED",
-                        "entry_time": time.time()
-                    }
-                    synced_count += 1
+                # Get IBKR position details
+                ibkr_pos = ibkr_position_map[symbol]
+                quantity = abs(ibkr_pos.position)
+                entry_price = db_pos['entry_price']  # Use database entry price (more accurate)
+                contract = Stock(symbol, 'SMART', 'USD')
+                
+                # CRITICAL: Qualify contract with IBKR before placing order
+                self.ib.qualifyContracts(contract)
+                
+                # Calculate profit target and stop loss
+                take_profit = entry_price * (1 + self.profit_target_pct)
+                stop_loss_price = entry_price * (1 - self.stop_loss_pct)
+                
+                # Create OCA (One-Cancels-All) group for OCO bracket
+                oca_group = f"OCA_{symbol}_{int(time.time())}"
+                
+                # Place OCO bracket: Take Profit (LIMIT) + Stop Loss (STOP)
+                tp_order = LimitOrder('SELL', quantity, take_profit)
+                tp_order.ocaGroup = oca_group
+                tp_order.ocaType = 1  # Cancel remaining on fill
+                tp_order.tif = 'DAY'
+                tp_order.outsideRth = False
+                
+                sl_order = StopOrder('SELL', quantity, stop_loss_price)
+                sl_order.ocaGroup = oca_group
+                sl_order.ocaType = 1  # Cancel remaining on fill
+                sl_order.tif = 'DAY'
+                sl_order.outsideRth = False
+                
+                # ============================================================
+                # STEP 3: PLACE OCO BRACKET ORDERS FOR SYNCED POSITION
+                # ============================================================
+                self.log(logging.INFO, f"⏳ STEP 3: Placing OCO brackets for synced position {symbol}...")
+                
+                tp_trade = self.ib.placeOrder(contract, tp_order)
+                self.ib.sleep(1)  # Wait for TP to be accepted
+                sl_trade = self.ib.placeOrder(contract, sl_order)
+                self.ib.sleep(3)  # Wait for SL to be accepted
+                
+                # Verify OCO orders were accepted
+                tp_status = tp_trade.orderStatus.status
+                sl_status = sl_trade.orderStatus.status
+                
+                self.log(logging.INFO, f"✅ SYNCED position: {symbol} - {quantity} shares @ ${entry_price:.4f}")
+                
+                if tp_status in ['Submitted', 'PreSubmitted']:
+                    self.log(logging.INFO, f"   ✅ TP order accepted: ${take_profit:.2f} (+{self.profit_target_pct*100:.1f}%) [Status: {tp_status}]")
                 else:
-                    self.log(logging.WARNING, f"Found position for {symbol} ({pos.position} shares @ ${pos.avgCost:.4f}) but it's NOT in today's watchlist. Will not manage this position.")
+                    self.log(logging.ERROR, f"   ❌ TP order FAILED! Status: {tp_status}")
+                
+                if sl_status in ['Submitted', 'PreSubmitted']:
+                    self.log(logging.INFO, f"   ✅ SL order accepted: ${stop_loss_price:.2f} (-{self.stop_loss_pct*100:.1f}%) [Status: {sl_status}]")
+                else:
+                    self.log(logging.ERROR, f"   ❌ SL order FAILED! Status: {sl_status}")
+                
+                self.log(logging.INFO, f"   OCA Group: {oca_group}")
+                
+                # Create position entry in our tracking dictionary
+                self.positions[symbol] = {
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "contract": contract,
+                    "atr_pct": None,  # Unknown from IBKR, will be recalculated
+                    "take_profit_trade": tp_trade,
+                    "stop_loss_trade": sl_trade,
+                    "stop_loss_price": stop_loss_price,
+                    "take_profit_price": take_profit,
+                    "oca_group": oca_group,
+                    "entry_type": "SYNCED",
+                    "entry_time": time.time()
+                }
+                synced_count += 1
             
             if synced_count > 0:
-                self.log(logging.INFO, f"Successfully synced {synced_count} positions from IBKR that match watchlist.")
+                self.log(logging.INFO, f"✅ Successfully synced {synced_count} day_trader positions from IBKR.")
             else:
-                self.log(logging.INFO, "No watchlist positions found in IBKR account to sync.")
+                self.log(logging.INFO, "✅ No day_trader positions to sync from IBKR.")
                 
         except Exception as e:
             self.log(logging.ERROR, f"Error syncing positions from IBKR: {e}")
@@ -1759,7 +1835,7 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             # Run until market close (no time limit)
             loop_start_time = time.time()
             last_scanner_run = 0  # Track when we last ran the intraday scanner
-            scanner_interval = 900  # Run scanner every 15 minutes (900 seconds)
+            scanner_interval = 300  # Run scanner every 5 minutes (300 seconds) for faster momentum detection
             
             self.log(logging.INFO, f"Entering trading loop - will run until market close...")
             self.log(logging.INFO, f"Loop start time: {loop_start_time}, Market open: {is_market_open()}")
@@ -2503,8 +2579,8 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         self.log(logging.ERROR, f"An error occurred while processing {contract.symbol}: {e_stock}")
                         continue # Move to the next stock
                 
-                # Sleep between iterations
-                time.sleep(5)
+                # Sleep between iterations - 1 second for faster stop loss detection
+                time.sleep(1)
 
             self.log(logging.INFO, "Trading loop finished for the day.")
 

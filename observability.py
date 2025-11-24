@@ -455,14 +455,20 @@ class TradingDatabase:
                 logger.error(f"Failed to remove position {symbol}: {e}")
                 return False
     
-    def is_position_active(self, symbol: str) -> bool:
-        """Check if symbol has an active position"""
+    def is_position_active(self, symbol: str, agent_name: Optional[str] = None) -> bool:
+        """Check if symbol has an active position, optionally filtered by agent"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) as count FROM active_positions 
-                WHERE symbol = ? AND status = 'OPEN'
-            """, (symbol,))
+            if agent_name:
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM active_positions 
+                    WHERE symbol = ? AND agent_name = ? AND status = 'OPEN'
+                """, (symbol, agent_name))
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM active_positions 
+                    WHERE symbol = ? AND status = 'OPEN'
+                """, (symbol,))
             return cursor.fetchone()['count'] > 0
     
     def was_closed_today(self, symbol: str) -> bool:
@@ -476,15 +482,26 @@ class TradingDatabase:
             """, (symbol, today))
             return cursor.fetchone()['count'] > 0
     
-    def get_active_positions(self) -> List[Dict]:
-        """Get all active positions"""
+    def get_active_positions(self, agent_name: Optional[str] = None) -> List[Dict]:
+        """Get all active positions, optionally filtered by agent"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM active_positions WHERE status = 'OPEN'
-                ORDER BY entry_timestamp DESC
-            """, ())
+            if agent_name:
+                cursor.execute("""
+                    SELECT * FROM active_positions 
+                    WHERE status = 'OPEN' AND agent_name = ?
+                    ORDER BY entry_timestamp DESC
+                """, (agent_name,))
+            else:
+                cursor.execute("""
+                    SELECT * FROM active_positions WHERE status = 'OPEN'
+                    ORDER BY entry_timestamp DESC
+                """, ())
             return [dict(row) for row in cursor.fetchall()]
+    
+    def get_positions_by_agent(self, agent_name: str) -> List[Dict]:
+        """Get all active positions owned by specific agent (alias for clarity)"""
+        return self.get_active_positions(agent_name=agent_name)
     
     def get_closed_today(self) -> List[Dict]:
         """Get all positions closed today"""

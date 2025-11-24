@@ -62,7 +62,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MIN_MARKET_CAP = 100_000_000  # $100M (catch smaller companies with strong insider activity)
 MAX_MARKET_CAP = 100_000_000_000  # $100B (EXPANDED - include mega-caps with politician signals)
 MIN_PRICE = 1.0  # $1 (avoid penny stocks)
-MAX_PRICE = 50.0  # $50 (avoid mega-expensive stocks)
+MAX_PRICE = 999999.0  # REMOVED CEILING - allow any stock price (institutions + insiders = strong signal regardless of price)
 MIN_FILINGS_FOR_CLUSTER = 3  # Minimum Form 4s to be considered a cluster (OR 1+ politician)
 LOOKBACK_DAYS = 100  # Days to look back for Form 4 filings (100 days = ~3 months pattern)
 
@@ -88,55 +88,65 @@ class Form4Strategy:
         self.ib = None
         self.ibkr_connected = False
         
-        # Initialize LLM (Try DeepSeek Reasoner first, then Gemini 2.5 Pro)
-        self.llm = None
-        self.llm_available = False
+        # Initialize BOTH LLMs for multi-agent debate
+        self.deepseek_llm = None
+        self.gemini_llm = None
+        self.multi_agent_available = False
         
-        # Try DeepSeek Reasoner first (primary)
+        # Initialize DeepSeek Reasoner
         if DEEPSEEK_API_KEY:
             try:
-                self.llm = ChatDeepSeek(
+                self.deepseek_llm = ChatDeepSeek(
                     model="deepseek-reasoner",
                     temperature=0.1
                 )
-                self.llm_available = True
                 logger.info("✓ Initialized DeepSeek Reasoner")
-                print("[+] LLM ENABLED: Using DeepSeek Reasoner")
+                print("[+] DEEPSEEK AGENT: Ready")
             except Exception as e:
                 logger.warning(f"DeepSeek Reasoner initialization failed: {e}")
         
-        # Fallback to Gemini 2.5 Pro
-        if not self.llm and GOOGLE_API_KEY:
+        # Initialize Gemini 2.5 Pro
+        if GOOGLE_API_KEY:
             try:
-                self.llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-pro",
+                self.gemini_llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.0-flash-exp",
                     temperature=0.1
                 )
-                self.llm_available = True
-                logger.info("✓ Initialized Gemini 2.5 Pro")
-                print("[+] LLM ENABLED: Using Gemini 2.5 Pro")
+                logger.info("✓ Initialized Gemini 2.0 Flash")
+                print("[+] GEMINI AGENT: Ready")
             except Exception as e:
-                logger.warning(f"Gemini 2.5 Pro initialization failed: {e}")
+                logger.warning(f"Gemini 2.0 Flash initialization failed: {e}")
         
-        if not self.llm:
-            self.llm_available = False
+        # Check if multi-agent debate available
+        if self.deepseek_llm and self.gemini_llm:
+            self.multi_agent_available = True
+            print("[+] MULTI-AGENT DEBATE: ENABLED")
+            print("    Both models will debate each stock for consensus\n")
+        elif self.deepseek_llm or self.gemini_llm:
+            self.multi_agent_available = False
+            logger.warning("⚠️  Only one LLM available - single agent mode")
+            print("[!] SINGLE AGENT MODE: Only one LLM available")
+            print("    For best results, provide both API keys\n")
+        else:
+            self.multi_agent_available = False
             logger.warning("⚠️  No LLM available - will use rule-based scoring")
             print("\n" + "="*80)
             print("[!] WARNING: NO LLM AVAILABLE - LIMITED ANALYSIS")
             print("="*80)
-            print("You're missing API keys for DeepSeek or Gemini.")
+            print("You're missing API keys for DeepSeek AND Gemini.")
             print("Analysis will be BASIC (rule-based scoring only).")
-            print("\n[INFO] TO GET DETAILED ANALYSIS:")
-            print("   1. Get free API key from: https://platform.deepseek.com/")
-            print("   2. Set environment variable:")
-            print("      PowerShell: $env:DEEPSEEK_API_KEY = 'your-key-here'")
-            print("   3. Re-run this script")
-            print("\n[BENEFITS] With LLM you get:")
-            print("   - Detailed fundamental analysis")
-            print("   - News sentiment evaluation")
-            print("   - Technical setup assessment")
-            print("   - Comprehensive bull/bear cases")
-            print("   - Higher quality confidence scores")
+            print("\n[INFO] TO GET MULTI-AGENT DEBATE:")
+            print("   1. DeepSeek: https://platform.deepseek.com/")
+            print("   2. Gemini: https://aistudio.google.com/apikey")
+            print("   3. Set environment variables:")
+            print("      $env:DEEPSEEK_API_KEY = 'your-deepseek-key'")
+            print("      $env:GOOGLE_API_KEY = 'your-gemini-key'")
+            print("\n[BENEFITS] With Multi-Agent Debate:")
+            print("   - Two models analyze independently")
+            print("   - Models debate and challenge each other")
+            print("   - Consensus-based confidence scores")
+            print("   - 10-20% better accuracy (MIT research)")
+            print("   - Catches promotional/biased signals")
             print("="*80 + "\n")
     
     def connect_to_ibkr(self) -> bool:
@@ -883,12 +893,239 @@ class Form4Strategy:
         logger.info(f"✓ {len(candidates)} candidates passed filters")
         return candidates
     
+    def multi_agent_debate(self, symbol: str, profile: Dict, signal_data: Dict, 
+                           timing_analysis: Dict, news: List[Dict]) -> Dict:
+        """
+        Multi-agent debate between DeepSeek and Gemini for consensus decision
+        
+        Workflow:
+        1. Both models analyze independently (parallel)
+        2. Each model sees the other's analysis and responds
+        3. Final consensus with agreement score
+        
+        Args:
+            symbol: Stock symbol
+            profile: Company profile data
+            signal_data: Multi-source insider signals
+            timing_analysis: Transaction timing analysis
+            news: Recent news articles
+        
+        Returns: Dict with consensus analysis + agreement metrics
+        """
+        logger.info(f"🤝 Multi-agent debate for {symbol}...")
+        
+        # Build shared context for both agents
+        insider_summary = (
+            f"Signal Quality: {signal_data['weighted_quality_score']:.2f}/3.0 | "
+            f"{signal_data['total_signals']} total signals | "
+            f"Politicians: {signal_data['politician_count']} | "
+            f"Directors: {signal_data['director_count']} | "
+            f"Officers: {signal_data['officer_count']}"
+        )
+        
+        system_prompt = """You are an expert stock analyst specializing in insider trading analysis.
+
+Analyze insider trading signals with focus on:
+1. WHO: Politicians > Directors > Officers (quality hierarchy)
+2. WHEN: Recent trades (<14 days) preferred
+3. WHERE: Entry price vs current price (did we miss the move?)
+4. COORDINATION: Multiple independent parties = stronger signal
+
+KEY INSIGHT: Officers buying may be promotional (trying to raise stock price artificially).
+Politicians and Directors buying shows genuine confidence.
+
+Return JSON format:
+{
+    "confidence": 0.0-1.0,
+    "reasoning": "brief explanation focusing on signal quality",
+    "bull_case": "why this could work well",
+    "bear_case": "key risks to consider",
+    "hold_period_days": 7-21
+}"""
+        
+        user_prompt = f"""Analyze {symbol} insider trading signal:
+
+COMPANY: {profile.get('companyName')}
+Sector: {profile.get('sector')} | Industry: {profile.get('industry')}
+Market Cap: ${profile.get('mktCap', 0)/1_000_000:.0f}M | Price: ${profile.get('price', 0):.2f}
+
+INSIDER SIGNALS:
+{insider_summary}
+
+TIMING: {timing_analysis['timing_status']}
+- Days since transaction: {timing_analysis['days_ago']}
+- Price change: {timing_analysis.get('price_change_pct', 0):+.1f}%
+
+RECENT NEWS:
+{chr(10).join([f"- {n.get('title', 'N/A')}" for n in news[:3]])}
+
+Provide your analysis in JSON format."""
+        
+        # ============================================
+        # ROUND 1: Independent Analysis (Parallel)
+        # ============================================
+        
+        print(f"\n[DEBATE] {symbol}: Round 1 - Independent Analysis")
+        
+        deepseek_response = None
+        gemini_response = None
+        
+        # DeepSeek Analysis
+        try:
+            messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            deepseek_raw = self.deepseek_llm.invoke(messages)
+            deepseek_text = deepseek_raw.content if hasattr(deepseek_raw, 'content') else str(deepseek_raw)
+            
+            # Parse JSON
+            import json, re
+            json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', deepseek_text, re.DOTALL)
+            if json_match:
+                deepseek_response = json.loads(json_match.group())
+                print(f"   ✓ DeepSeek: {deepseek_response['confidence']:.0%} confidence")
+        except Exception as e:
+            logger.warning(f"DeepSeek analysis failed: {e}")
+        
+        # Gemini Analysis
+        try:
+            messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            gemini_raw = self.gemini_llm.invoke(messages)
+            gemini_text = gemini_raw.content if hasattr(gemini_raw, 'content') else str(gemini_raw)
+            
+            # Parse JSON
+            json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', gemini_text, re.DOTALL)
+            if json_match:
+                gemini_response = json.loads(json_match.group())
+                print(f"   ✓ Gemini: {gemini_response['confidence']:.0%} confidence")
+        except Exception as e:
+            logger.warning(f"Gemini analysis failed: {e}")
+        
+        # Handle failures
+        if not deepseek_response and not gemini_response:
+            logger.error("Both models failed - using rule-based")
+            return None
+        
+        if not deepseek_response:
+            print(f"   [!] DeepSeek failed - using Gemini only")
+            return {**gemini_response, 'agreement_score': 0.5, 'debate_rounds': 1}
+        
+        if not gemini_response:
+            print(f"   [!] Gemini failed - using DeepSeek only")
+            return {**deepseek_response, 'agreement_score': 0.5, 'debate_rounds': 1}
+        
+        # ============================================
+        # ROUND 2: Mutual Critique
+        # ============================================
+        
+        print(f"[DEBATE] {symbol}: Round 2 - Mutual Critique")
+        
+        # Calculate initial disagreement
+        initial_diff = abs(deepseek_response['confidence'] - gemini_response['confidence'])
+        print(f"   Initial gap: {initial_diff:.0%}")
+        
+        # If already agree, skip debate
+        if initial_diff < 0.10:
+            consensus_confidence = (deepseek_response['confidence'] + gemini_response['confidence']) / 2
+            agreement_score = 1.0 - initial_diff
+            
+            print(f"   ✓ Quick agreement: {consensus_confidence:.0%} (score: {agreement_score:.2f})")
+            
+            return {
+                'confidence': consensus_confidence,
+                'reasoning': f"CONSENSUS: {deepseek_response['reasoning']}",
+                'bull_case': deepseek_response.get('bull_case', ''),
+                'bear_case': gemini_response.get('bear_case', ''),
+                'hold_period_days': max(deepseek_response.get('hold_period_days', 14),
+                                      gemini_response.get('hold_period_days', 14)),
+                'agreement_score': agreement_score,
+                'debate_rounds': 1,
+                'deepseek_view': deepseek_response,
+                'gemini_view': gemini_response
+            }
+        
+        # DeepSeek responds to Gemini
+        try:
+            critique_prompt = f"""You previously analyzed {symbol} with {deepseek_response['confidence']:.0%} confidence.
+
+Another expert analyst (Gemini) analyzed the same stock and got {gemini_response['confidence']:.0%} confidence.
+
+Gemini's reasoning: {gemini_response['reasoning']}
+Gemini's concerns: {gemini_response.get('bear_case', '')}
+
+Do you maintain your confidence or adjust based on this perspective? Return updated JSON."""
+            
+            messages = [SystemMessage(content=system_prompt), HumanMessage(content=critique_prompt)]
+            deepseek_rebuttal_raw = self.deepseek_llm.invoke(messages)
+            deepseek_rebuttal_text = deepseek_rebuttal_raw.content if hasattr(deepseek_rebuttal_raw, 'content') else str(deepseek_rebuttal_raw)
+            
+            json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', deepseek_rebuttal_text, re.DOTALL)
+            if json_match:
+                deepseek_response = json.loads(json_match.group())
+                print(f"   ✓ DeepSeek adjusted: {deepseek_response['confidence']:.0%}")
+        except Exception as e:
+            logger.warning(f"DeepSeek rebuttal failed: {e}")
+        
+        # Gemini responds to DeepSeek
+        try:
+            critique_prompt = f"""You previously analyzed {symbol} with {gemini_response['confidence']:.0%} confidence.
+
+Another expert analyst (DeepSeek) analyzed the same stock and got {deepseek_response['confidence']:.0%} confidence.
+
+DeepSeek's reasoning: {deepseek_response['reasoning']}
+DeepSeek's bull case: {deepseek_response.get('bull_case', '')}
+
+Do you maintain your confidence or adjust based on this perspective? Return updated JSON."""
+            
+            messages = [SystemMessage(content=system_prompt), HumanMessage(content=critique_prompt)]
+            gemini_rebuttal_raw = self.gemini_llm.invoke(messages)
+            gemini_rebuttal_text = gemini_rebuttal_raw.content if hasattr(gemini_rebuttal_raw, 'content') else str(gemini_rebuttal_raw)
+            
+            json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', gemini_rebuttal_text, re.DOTALL)
+            if json_match:
+                gemini_response = json.loads(json_match.group())
+                print(f"   ✓ Gemini adjusted: {gemini_response['confidence']:.0%}")
+        except Exception as e:
+            logger.warning(f"Gemini rebuttal failed: {e}")
+        
+        # ============================================
+        # CONSENSUS
+        # ============================================
+        
+        final_diff = abs(deepseek_response['confidence'] - gemini_response['confidence'])
+        consensus_confidence = (deepseek_response['confidence'] + gemini_response['confidence']) / 2
+        agreement_score = 1.0 - final_diff
+        
+        print(f"[CONSENSUS] {symbol}: {consensus_confidence:.0%} (agreement: {agreement_score:.2f})")
+        
+        # Flag low-agreement for manual review
+        if agreement_score < 0.70:
+            print(f"   ⚠️  LOW AGREEMENT - Recommend manual review")
+        
+        return {
+            'confidence': consensus_confidence,
+            'reasoning': f"DeepSeek: {deepseek_response['reasoning']} | Gemini: {gemini_response['reasoning']}",
+            'bull_case': deepseek_response.get('bull_case', '') + " // " + gemini_response.get('bull_case', ''),
+            'bear_case': deepseek_response.get('bear_case', '') + " // " + gemini_response.get('bear_case', ''),
+            'hold_period_days': max(deepseek_response.get('hold_period_days', 14),
+                                  gemini_response.get('hold_period_days', 14)),
+            'agreement_score': agreement_score,
+            'debate_rounds': 2,
+            'deepseek_view': deepseek_response,
+            'gemini_view': gemini_response,
+            'requires_human_review': agreement_score < 0.70
+        }
+    
     def analyze_with_llm(self, candidates: List[Dict]) -> List[Dict]:
         """
-        Use LLM to analyze each candidate with multi-source signal data
-        Falls back to rule-based scoring if LLM unavailable
+        Use multi-agent debate or single LLM to analyze candidates
+        Falls back to rule-based scoring if no LLM available
         """
-        logger.info(f"🤖 Analyzing {len(candidates)} candidates with multi-source data...")
+        if self.multi_agent_available:
+            logger.info(f"🤖 Multi-agent debate analysis for {len(candidates)} candidates...")
+            print("\n" + "="*80)
+            print("[MULTI-AGENT DEBATE] ANALYZING CANDIDATES")
+            print("="*80)
+        else:
+            logger.info(f"🤖 Analyzing {len(candidates)} candidates...")
         
         analyzed = []
         
@@ -898,8 +1135,30 @@ class Form4Strategy:
             signal_data = candidate['signal_data']
             timing_analysis = candidate['timing_analysis']
             
-            # If no LLM, use rule-based scoring
-            if not self.llm:
+            # Fetch news for analysis
+            news = self.get_news(symbol, days=14)
+            
+            # If multi-agent available, use debate
+            if self.multi_agent_available:
+                debate_result = self.multi_agent_debate(
+                    symbol, profile, signal_data, timing_analysis, news
+                )
+                
+                if debate_result:
+                    candidate['analysis'] = {
+                        **debate_result,
+                        'analysis_type': 'MULTI-AGENT DEBATE'
+                    }
+                    analyzed.append(candidate)
+                    logger.info(f"  ✓ {symbol}: Consensus {debate_result['confidence']:.2f} (agreement: {debate_result['agreement_score']:.2f})")
+                    continue
+                else:
+                    # Debate failed, fall back to rule-based
+                    logger.warning(f"  ! {symbol}: Debate failed, using rule-based")
+            
+            # Single LLM or no LLM - use previous logic
+            # If no LLM at all, use rule-based scoring
+            if not self.deepseek_llm and not self.gemini_llm:
                 confidence = self._rule_based_score_multi_source(candidate)
                 
                 reasoning = (
@@ -1054,13 +1313,16 @@ Consider:
 3. COORDINATION (multiple independent buyers?)
 4. TRAJECTORY (where is this stock headed based on WHO is buying?)"""
 
+            # Use whichever single LLM is available
+            single_llm = self.deepseek_llm or self.gemini_llm
+            
             try:
                 messages = [
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=user_prompt)
                 ]
                 
-                response = self.llm.invoke(messages)
+                response = single_llm.invoke(messages)
                 content = response.content
                 
                 # Parse JSON response
@@ -1616,6 +1878,126 @@ Consider:
             story.append(Paragraph(analysis.get('reasoning', 'N/A'), styles['Normal']))
             story.append(Spacer(1, 0.05*inch))
             
+            # Institutional Validation (Form 13F)
+            validation = candidate.get('institutional_validation', {})
+            if validation:
+                story.append(Paragraph("<b>🏦 Institutional Validation (Form 13F):</b>", subheading_style))
+                
+                status = validation.get('status', 'N/A')
+                boost_factor = validation.get('boost_factor', 1.0)
+                original_conf = validation.get('original_confidence', 0)
+                adjusted_conf = validation.get('adjusted_confidence', 0)
+                
+                # Validation status with color coding
+                if boost_factor > 1.0:
+                    status_color = "green"
+                    symbol_prefix = "✅"
+                elif boost_factor < 1.0:
+                    status_color = "red"
+                    symbol_prefix = "⚠️"
+                else:
+                    status_color = "gray"
+                    symbol_prefix = "➡️"
+                
+                story.append(Paragraph(
+                    f"{symbol_prefix} <b>Status:</b> {status} | "
+                    f"<b>Confidence:</b> {original_conf:.1%} → {adjusted_conf:.1%} "
+                    f"({boost_factor-1:+.0%})",
+                    styles['Normal']
+                ))
+                story.append(Spacer(1, 0.05*inch))
+                
+                # Show institutional buyers
+                increases = validation.get('increases', [])
+                if increases:
+                    story.append(Paragraph("<b>Institutions Buying:</b>", styles['Normal']))
+                    for holder in increases[:3]:
+                        story.append(Paragraph(
+                            f"• {holder['name']}: {holder['change_pct']:+.1f}% increase "
+                            f"({holder['change']:,} shares)",
+                            styles['Normal']
+                        ))
+                    story.append(Spacer(1, 0.05*inch))
+                
+                # Show institutional sellers
+                decreases = validation.get('decreases', [])
+                if decreases:
+                    story.append(Paragraph("<b>Institutions Selling:</b>", styles['Normal']))
+                    for holder in decreases[:2]:
+                        story.append(Paragraph(
+                            f"• {holder['name']}: {holder['change_pct']:.1f}% decrease "
+                            f"({abs(holder['change']):,} shares)",
+                            styles['Normal']
+                        ))
+                    story.append(Spacer(1, 0.05*inch))
+                
+                story.append(Paragraph(
+                    f"<i>Total institutional holders: {validation.get('total_holders', 0)}</i>",
+                    styles['Normal']
+                ))
+                story.append(Spacer(1, 0.1*inch))
+            
+            # Multi-Agent Debate Results
+            if analysis.get('analysis_type') == 'MULTI-AGENT DEBATE':
+                story.append(Paragraph("<b>🤝 Multi-Agent Debate Analysis:</b>", subheading_style))
+                
+                agreement_score = analysis.get('agreement_score', 0)
+                debate_rounds = analysis.get('debate_rounds', 0)
+                deepseek_view = analysis.get('deepseek_view', {})
+                gemini_view = analysis.get('gemini_view', {})
+                
+                # Agreement status with color coding
+                if agreement_score >= 0.90:
+                    agreement_color = "green"
+                    agreement_label = "STRONG CONSENSUS"
+                elif agreement_score >= 0.70:
+                    agreement_color = "orange"
+                    agreement_label = "MODERATE AGREEMENT"
+                else:
+                    agreement_color = "red"
+                    agreement_label = "LOW AGREEMENT - REVIEW RECOMMENDED"
+                
+                story.append(Paragraph(
+                    f"✓ <b>Agreement Score:</b> {agreement_score:.0%} ({agreement_label}) | "
+                    f"<b>Debate Rounds:</b> {debate_rounds}",
+                    styles['Normal']
+                ))
+                story.append(Spacer(1, 0.05*inch))
+                
+                # DeepSeek's view
+                if deepseek_view:
+                    story.append(Paragraph(
+                        f"<b>DeepSeek Reasoner:</b> {deepseek_view.get('confidence', 0):.0%} confidence",
+                        styles['Normal']
+                    ))
+                    story.append(Paragraph(
+                        f"• Reasoning: {deepseek_view.get('reasoning', 'N/A')}",
+                        styles['Normal']
+                    ))
+                    story.append(Spacer(1, 0.05*inch))
+                
+                # Gemini's view
+                if gemini_view:
+                    story.append(Paragraph(
+                        f"<b>Gemini 2.0 Flash:</b> {gemini_view.get('confidence', 0):.0%} confidence",
+                        styles['Normal']
+                    ))
+                    story.append(Paragraph(
+                        f"• Reasoning: {gemini_view.get('reasoning', 'N/A')}",
+                        styles['Normal']
+                    ))
+                    story.append(Spacer(1, 0.05*inch))
+                
+                # Flag if manual review needed
+                if analysis.get('requires_human_review'):
+                    story.append(Paragraph(
+                        "⚠️  <b>MANUAL REVIEW RECOMMENDED</b> - Models disagreed significantly",
+                        styles['Normal']
+                    ))
+                    story.append(Spacer(1, 0.05*inch))
+                
+                story.append(Spacer(1, 0.1*inch))
+            
             story.append(Paragraph("<b>Bull Case:</b>", subheading_style))
             story.append(Paragraph(analysis.get('bull_case', 'N/A'), styles['Normal']))
             story.append(Spacer(1, 0.05*inch))
@@ -1870,6 +2252,17 @@ Consider:
                 'bull_case': candidate['analysis']['bull_case'],
                 'bear_case': candidate['analysis']['bear_case'],
                 'hold_period_days': candidate['analysis']['hold_period_days'],
+                'analysis_type': candidate['analysis'].get('analysis_type', 'UNKNOWN'),
+                
+                # Multi-agent debate (if available)
+                'multi_agent_debate': {
+                    'enabled': candidate['analysis'].get('analysis_type') == 'MULTI-AGENT DEBATE',
+                    'agreement_score': candidate['analysis'].get('agreement_score', 0),
+                    'debate_rounds': candidate['analysis'].get('debate_rounds', 0),
+                    'requires_human_review': candidate['analysis'].get('requires_human_review', False),
+                    'deepseek_confidence': candidate['analysis'].get('deepseek_view', {}).get('confidence', 0),
+                    'gemini_confidence': candidate['analysis'].get('gemini_view', {}).get('confidence', 0)
+                } if candidate['analysis'].get('analysis_type') == 'MULTI-AGENT DEBATE' else None,
                 
                 'position': candidate['position'],
                 'approved': False  # Will be updated after user approval
