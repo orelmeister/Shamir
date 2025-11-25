@@ -1829,12 +1829,24 @@ class IntradayTraderAgent(BaseDayTraderAgent):
         The core loop that fetches market data, applies indicators,
         and makes trade decisions with robust error handling.
         Uses delayed/snapshot data (free) instead of real-time streaming.
+        
+        CRITICAL: Runs even with zero capital to monitor/exit existing positions.
         """
-        if not self.watchlist_data or self.capital_per_stock <= 0:
-            self.log(logging.INFO, "Trading loop skipped due to empty watchlist or zero capital.")
+        # Check if we have existing positions to monitor
+        has_positions = len(self.positions) > 0
+        
+        if not self.watchlist_data and not has_positions:
+            self.log(logging.INFO, "Trading loop skipped: no watchlist and no positions to monitor.")
             return
-
-        self.log(logging.INFO, f"Starting the main trading loop for {len(self.watchlist_data)} stocks.")
+        
+        # Log trading mode
+        if self.capital_per_stock <= 0 and has_positions:
+            self.log(logging.WARNING, "⚠️  EXIT-ONLY MODE: No capital available for new entries.")
+            self.log(logging.WARNING, f"   Monitoring {len(self.positions)} existing positions for exit signals.")
+        elif has_positions:
+            self.log(logging.INFO, f"Starting trading loop: {len(self.watchlist_data)} stocks on watchlist, {len(self.positions)} positions open.")
+        else:
+            self.log(logging.INFO, f"Starting the main trading loop for {len(self.watchlist_data)} stocks.")
 
         # --- 1. Create Contracts with SMART Routing (let IBKR find the exchange) ---
         contracts_for_data = []
@@ -2220,7 +2232,8 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         position = self.positions.get(contract.symbol)
 
                         # Entry Logic: No position is open AND no pending order AND not recently failed
-                        if position is None and contract.symbol not in self.pending_orders:
+                        # CRITICAL: Only attempt entries if we have capital available
+                        if position is None and contract.symbol not in self.pending_orders and self.capital_per_stock > 0:
                             # CRITICAL: Check max positions limit BEFORE placing any new orders
                             total_positions = len(self.positions) + len(self.pending_orders)
                             MAX_CONCURRENT_POSITIONS = 2  # Max 2 positions at once (conservative)

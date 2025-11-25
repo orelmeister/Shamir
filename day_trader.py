@@ -572,6 +572,15 @@ class DayTraderOrchestrator:
                 if wait_seconds > 0:
                     self.log(logging.INFO, f"Next momentum check at {next_check.strftime('%I:%M:%S %p ET')} ({int(wait_seconds/60)} minutes)")
                     time.sleep(wait_seconds)
+            
+            # CRITICAL: Disconnect Phase 1.75's connection before Phase 2
+            self.log(logging.INFO, "Disconnecting Phase 1.75 IBKR connection (ClientId 2)...")
+            if intraday_agent.ib.isConnected():
+                intraday_agent.ib.disconnect()
+                self.log(logging.INFO, "✅ Phase 1.75 disconnected successfully.")
+                time.sleep(2)  # Give IBKR time to clean up the connection
+            else:
+                self.log(logging.WARNING, "Phase 1.75 was already disconnected.")
 
 
         # --- Phase 2: Intraday Trading ---
