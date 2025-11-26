@@ -2200,7 +2200,13 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                         vwap_col = next((col for col in df.columns if 'VWAP' in col), None)
                         atr_col = next((col for col in df.columns if 'ATR' in col), None)
                         
-                        if not vwap_col or pd.isna(latest_data[vwap_col]):
+                        # CRITICAL: Check if VWAP column exists before accessing
+                        if not vwap_col:
+                            self.log(logging.WARNING, f"VWAP column not found for {contract.symbol}. Skipping.")
+                            continue
+                        
+                        # CRITICAL: Check if VWAP value is valid before accessing
+                        if pd.isna(latest_data[vwap_col]):
                             self.log(logging.WARNING, f"VWAP could not be calculated for {contract.symbol}. Check historical data.")
                             continue
                             
@@ -2212,7 +2218,13 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                             continue
                             
                         rsi = latest_data['RSI_14']
-                        atr = latest_data[atr_col] if atr_col and not pd.isna(latest_data[atr_col]) else None
+                        
+                        # CRITICAL FIX: Only access atr_col if it exists (prevents NoneType subscriptable error)
+                        if atr_col and atr_col in df.columns and not pd.isna(latest_data[atr_col]):
+                            atr = latest_data[atr_col]
+                        else:
+                            atr = None
+                        
                         current_price = latest_data['close']  # Get current price from latest bar
 
                         if pd.isna(rsi) or pd.isna(current_price):
