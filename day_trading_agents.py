@@ -1349,6 +1349,54 @@ class IntradayTraderAgent(BaseDayTraderAgent):
             # Get positions owned by day_trader from database
             db_day_trader_positions = self.db.get_positions_by_agent('day_trader')
             
+            # CRITICAL: Also check IBKR for orphaned positions that need to be synced
+            ibkr_positions = self.ib.positions()
+            day_trader_symbols_in_ibkr = []
+            
+            for pos in ibkr_positions:
+                symbol = pos.contract.symbol
+                # Check if position is in trades table as day_trader purchase
+                trades = self.db.get_trades_by_symbol(symbol)
+                is_day_trader = any(t['agent_name'] == 'day_trader' and t['action'] == 'BUY' for t in trades)
+                if is_day_trader:
+                    day_trader_symbols_in_ibkr.append(symbol)
+            
+            if not db_day_trader_positions and not day_trader_symbols_in_ibkr:
+                self.log(logging.INFO, "✅ No day_trader positions in database or IBKR. Starting fresh.")
+                return
+            
+            # Sync orphaned positions from IBKR to database
+            if day_trader_symbols_in_ibkr and not db_day_trader_positions:
+                self.log(logging.WARNING, f"⚠️  Found {len(day_trader_symbols_in_ibkr)} day_trader positions in IBKR but not in active_positions table!")
+                self.log(logging.WARNING, f"   Orphaned positions: {', '.join(day_trader_symbols_in_ibkr)}")
+                
+                # Add them to active_positions table so they can be liquidated
+                for pos in ibkr_positions:
+                    if pos.contract.symbol in day_trader_symbols_in_ibkr:
+                        self.log(logging.INFO, f"   Syncing orphaned position: {pos.contract.symbol} x{pos.position} @ ${pos.avgCost:.2f}")
+                        self.db.add_active_position(
+                            symbol=pos.contract.symbol,
+                            quantity=pos.position,
+                            entry_price=pos.avgCost,
+                            agent_name='day_trader',
+                            profit_target=pos.avgCost * 1.018,  # +1.8%
+                            stop_loss=pos.avgCost * 0.991  # -0.9%
+                        )
+                        # Also add to self.positions for tracking
+                        contract = Stock(pos.contract.symbol, 'SMART', 'USD')
+                        self.positions[pos.contract.symbol] = {
+                            "quantity": pos.position,
+                            "entry_price": pos.avgCost,
+                            "contract": contract,
+                            "atr_pct": None,
+                            "entry_type": "ORPHANED",
+                            "entry_time": time.time()
+                        }
+                
+                self.log(logging.INFO, f"✅ Synced {len(day_trader_symbols_in_ibkr)} orphaned positions to active_positions table")
+                # Refresh db_day_trader_positions after sync
+                db_day_trader_positions = self.db.get_positions_by_agent('day_trader')
+            
             if not db_day_trader_positions:
                 self.log(logging.INFO, "✅ No day_trader positions in database. Starting fresh.")
                 return
@@ -2289,7 +2337,11 @@ class IntradayTraderAgent(BaseDayTraderAgent):
                                 continue
                             
                             # Calculate pre-market gap from watchlist data
-                            ticker_info = next((t for t in self.watchlist_data if t.get('ticker') == contract.symbol), None)
+                            # CRITICAL FIX: Check if watchlist_data is None before iterating
+                            ticker_info = None
+                            if self.watchlist_data:
+                                ticker_info = next((t for t in self.watchlist_data if t.get('ticker') == contract.symbol), None)
+                            
                             pre_market_gap = 0
                             if ticker_info and 'premarket_change' in ticker_info:
                                 pre_market_gap = abs(ticker_info.get('premarket_change', 0))
