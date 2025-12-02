@@ -21,6 +21,11 @@ import pandas as pd
 from shared_state.state_manager import read_state, write_state
 from market_hours import is_market_open
 
+# Autonomous system imports
+from observability import get_database, get_tracer
+from self_evaluation import PerformanceAnalyzer
+from continuous_improvement import ContinuousImprovementEngine
+
 # Configuration
 IB_HOST = '127.0.0.1'
 IB_PORT = 4001
@@ -228,6 +233,11 @@ def check_stops_and_exits(position_tracker):
     """
     logger.info("Checking stop losses and trailing stops...")
     
+    # Initialize autonomous system components
+    agent_name = "weekly_portfolio_manager"
+    db = get_database()
+    tracer = get_tracer()
+    
     ib = IB()
     positions_to_sell = []
     
@@ -271,6 +281,41 @@ def check_stops_and_exits(position_tracker):
             trade = ib.placeOrder(contract, order)
             ib.sleep(2)
             logger.info(f"Sell order placed for {symbol}")
+            
+            # Log trade to database for observability
+            try:
+                pos_data = position_tracker.get_position(symbol)
+                fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus.avgFillPrice > 0 else pos_data['current_price']
+                pnl = (fill_price - pos_data['entry_price']) * abs(quantity)
+                pnl_pct = ((fill_price - pos_data['entry_price']) / pos_data['entry_price']) * 100
+                
+                db.log_trade({
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'action': 'SELL',
+                    'quantity': abs(quantity),
+                    'price': fill_price,
+                    'agent_name': agent_name,
+                    'reason': reason,
+                    'profit_loss': pnl,
+                    'profit_loss_pct': pnl_pct,
+                    'metadata': {
+                        'entry_price': pos_data['entry_price'],
+                        'exit_trigger': reason,
+                        'highest_price': pos_data.get('highest_price', fill_price),
+                        'stop_loss_price': pos_data.get('stop_loss_price', 0)
+                    }
+                })
+                
+                db.remove_active_position(
+                    symbol=symbol,
+                    exit_price=fill_price,
+                    exit_reason=reason,
+                    agent_name=agent_name
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log SELL trade for {symbol}: {e}")
+            
             position_tracker.remove_position(symbol)
         
         if positions_to_sell:
@@ -443,6 +488,11 @@ def load_approved_trades():
 def execute_approved_trades_only(approved_trades, position_tracker):
     """Execute only user-approved trades."""
     
+    # Initialize autonomous system components
+    agent_name = "weekly_portfolio_manager"
+    db = get_database()
+    tracer = get_tracer()
+    
     if not approved_trades:
         logger.info("No approved trades to execute")
         return {"status": "SUCCESS", "reason": "No approved trades", "executed_trades": []}
@@ -519,6 +569,39 @@ def execute_approved_trades_only(approved_trades, position_tracker):
                 position_tracker.remove_position(symbol)
                 executed_trades.append(f"SELL {quantity} {symbol}")
                 logger.info(f"[OK] Sold {quantity} {symbol}")
+                
+                # Log trade to database for observability
+                try:
+                    fill_price = trade.orderStatus.avgFillPrice if trade.orderStatus.avgFillPrice > 0 else ticker_data.marketPrice()
+                    entry_price = pos.avgCost
+                    pnl = (fill_price - entry_price) * quantity
+                    pnl_pct = ((fill_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                    
+                    db.log_trade({
+                        'timestamp': datetime.now().isoformat(),
+                        'symbol': symbol,
+                        'action': 'SELL',
+                        'quantity': quantity,
+                        'price': fill_price,
+                        'agent_name': agent_name,
+                        'reason': 'Rebalancing SELL (approved trade)',
+                        'profit_loss': pnl,
+                        'profit_loss_pct': pnl_pct,
+                        'metadata': {
+                            'entry_price': entry_price,
+                            'rebalance_action': 'approved_trade',
+                            'order_type': 'MKT'
+                        }
+                    })
+                    
+                    db.remove_active_position(
+                        symbol=symbol,
+                        exit_price=fill_price,
+                        exit_reason='Rebalancing SELL',
+                        agent_name=agent_name
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log SELL trade for {symbol}: {e}")
             
             elif action == "BUY":
                 logger.info(f"Fetching price for {symbol}...")
@@ -589,6 +672,42 @@ def execute_approved_trades_only(approved_trades, position_tracker):
                             total_spent += quantity * fill_price
                             logger.info(f"[OK] ✓ Bought {quantity} {symbol} @ ${fill_price:.2f} (Total spent: ${total_spent:.2f})")
                             logger.info(f"   Tracking: Entry=${fill_price:.2f}, Stop=${pos_data['stop_loss_price']:.2f}")
+                            
+                            # Log trade to database for observability
+                            try:
+                                db.log_trade({
+                                    'timestamp': datetime.now().isoformat(),
+                                    'symbol': symbol,
+                                    'action': 'BUY',
+                                    'quantity': quantity,
+                                    'price': fill_price,
+                                    'agent_name': agent_name,
+                                    'reason': 'Rebalancing BUY (approved trade)',
+                                    'metadata': {
+                                        'analyst_score': approved.get('analyst_score', 'N/A'),
+                                        'expected_return': approved.get('expected_return', 'N/A'),
+                                        'rebalance_action': 'approved_trade',
+                                        'order_type': 'MKT',
+                                        'capital_allocated': quantity * fill_price
+                                    }
+                                })
+                                
+                                db.add_active_position(
+                                    symbol=symbol,
+                                    quantity=quantity,
+                                    entry_price=fill_price,
+                                    agent_name=agent_name,
+                                    profit_target=fill_price * 1.20,  # 20% target
+                                    stop_loss=pos_data['stop_loss_price'],
+                                    metadata={
+                                        'analyst_score': approved.get('analyst_score', 'N/A'),
+                                        'expected_return': approved.get('expected_return', 'N/A'),
+                                        'entry_reason': 'Weekly rebalancing',
+                                        'trailing_stop_active': False
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to log BUY trade for {symbol}: {e}")
                         elif trade.orderStatus.status in ['PreSubmitted', 'Submitted']:
                             # Order pending, assume it will fill
                             logger.info(f"[PENDING] Order for {symbol} submitted, waiting for fill...")
@@ -702,6 +821,29 @@ def main():
     logger.info(f"PHASE 3: PORTFOLIO MANAGER - Complete")
     logger.info(f"Executed {len(trade_result.get('executed_trades', []))} trades")
     logger.info("=" * 80)
+    
+    # STEP 5: Run weekly improvement cycle (autonomous system)
+    if datetime.now().weekday() == 6:  # Sunday (after weekly rebalancing)
+        try:
+            logger.info("📊 Running weekly autonomous improvement cycle...")
+            improvement_engine = ContinuousImprovementEngine("weekly_portfolio_manager")
+            improvement_report = improvement_engine.daily_improvement_cycle()
+            
+            if improvement_report.get('parameter_changes'):
+                logger.info(f"✅ Parameters autonomously updated:")
+                for param, change in improvement_report['parameter_changes'].items():
+                    logger.info(f"   • {param}: {change['old']} → {change['new']}")
+            else:
+                logger.info("⏸  No parameter changes this week (monitoring)")
+            
+            if improvement_report.get('llm_insights'):
+                insights = improvement_report['llm_insights']
+                if isinstance(insights, dict) and 'assessment' in insights:
+                    logger.info(f"💡 LLM Assessment: {insights['assessment'][:200]}...")
+            
+            logger.info(f"📁 Improvement report saved: reports/improvement/improvement_report_{datetime.now().strftime('%Y-%m-%d')}.json")
+        except Exception as e:
+            logger.warning(f"Failed to run improvement cycle: {e}")
 
 
 if __name__ == "__main__":

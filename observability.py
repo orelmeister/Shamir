@@ -588,11 +588,11 @@ class TradingTracer:
 _db_instance = None
 _tracer_instance = None
 
-def get_database() -> TradingDatabase:
+def get_database(db_path: str = "databases/trading_history.db") -> TradingDatabase:
     """Get or create global database instance"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = TradingDatabase()
+        _db_instance = TradingDatabase(db_path)
     return _db_instance
 
 def get_tracer() -> TradingTracer:

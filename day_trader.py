@@ -308,8 +308,86 @@ class DayTraderOrchestrator:
         """
         Starts the full day-trading workflow.
         Waits until 8:30 AM ET if started after market hours.
+        
+        HOLIDAY CHECK: Exits immediately if market is closed (holiday or weekend).
+        FRIDAY LOGIC: On Fridays, only manages exits (no new entries) due to short day and weekend risk.
         """
+        from market_hours import is_market_holiday
+        
         self.log(logging.INFO, "Starting the day trading bot workflow.")
+        
+        # Check current time in ET
+        et_tz = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et_tz)
+        current_time = now_et.time()
+        today_weekday = now_et.weekday()  # 0=Monday, 4=Friday
+        
+        # CRITICAL: Check if today is a market holiday BEFORE doing anything
+        if is_market_holiday():
+            self.log(logging.WARNING, "=" * 60)
+            self.log(logging.WARNING, "🚫 MARKET HOLIDAY DETECTED - BOT SHUTTING DOWN")
+            self.log(logging.WARNING, "=" * 60)
+            self.log(logging.INFO, "No trading today. The bot will not run any analysis or spend money on LLM calls.")
+            self.log(logging.INFO, "Exiting gracefully. See you next trading day! 👋")
+            return  # Exit immediately
+        
+        # Check if today is Friday (4 = Friday)
+        is_friday = (today_weekday == 4)
+        
+        if is_friday:
+            self.log(logging.WARNING, "=" * 60)
+            self.log(logging.WARNING, "📅 FRIDAY DETECTED - EXIT-ONLY MODE")
+            self.log(logging.WARNING, "=" * 60)
+            self.log(logging.INFO, "On Fridays, the bot will ONLY manage existing positions (exits if needed).")
+            self.log(logging.INFO, "NO NEW ENTRIES will be made due to short trading day and weekend risk.")
+            self.log(logging.INFO, "=" * 60)
+            
+            # Skip all pre-market analysis and data collection phases
+            # Jump directly to position monitoring at market open
+            self.log(logging.INFO, "Skipping Phase -1, 0, 1, 1.5, 1.75 (no new trades on Friday)")
+            
+            # Wait for market open if before 9:30 AM
+            market_open_time = dt_time(9, 30)
+            if current_time < market_open_time:
+                today = now_et.date()
+                target_datetime = et_tz.localize(datetime.combine(today, market_open_time))
+                seconds_until_open = (target_datetime - now_et).total_seconds()
+                
+                hours_until = int(seconds_until_open // 3600)
+                minutes_until = int((seconds_until_open % 3600) // 60)
+                
+                self.log(logging.INFO, f"[FRIDAY] Waiting {hours_until}h {minutes_until}m until market open (9:30 AM ET)...")
+                time.sleep(seconds_until_open)
+            
+            # Run exit-only phase (Phase 2 with no new entries)
+            self.log(logging.INFO, "=" * 60)
+            self.log(logging.INFO, "PHASE 2: EXIT-ONLY MODE (Friday)")
+            self.log(logging.INFO, "=" * 60)
+            
+            # Initialize trading agent with empty watchlist (no new entries)
+            from day_trading_agents import IntradayTraderAgent
+            
+            trader = IntradayTraderAgent(
+                orchestrator=self,
+                allocation=self.capital_allocation,
+                paper_trade=self.paper_trade
+            )
+            
+            # Override watchlist to be empty (prevents new entries)
+            trader.watchlist_data = []
+            trader.scanner_interval = 900  # Still check every 15 min for exits
+            
+            self.log(logging.INFO, "🚫 Friday Mode: Watchlist is EMPTY - no new trades will be entered")
+            self.log(logging.INFO, "✅ Exit monitoring: Bot will check existing positions every 15 minutes")
+            
+            trader.run()
+            
+            self.log(logging.INFO, "=" * 60)
+            self.log(logging.INFO, "[FRIDAY] Exit-only session complete. Have a great weekend! 🎉")
+            self.log(logging.INFO, "=" * 60)
+            return  # Exit after managing positions
+        
+        # Regular weekday (Monday-Thursday) logic continues below...
         
         # Check current time in ET
         et_tz = pytz.timezone('US/Eastern')

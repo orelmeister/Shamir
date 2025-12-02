@@ -37,6 +37,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Add parent directory for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # IBKR imports
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, util
 
@@ -44,6 +47,9 @@ from ib_insync import IB, Stock, MarketOrder, LimitOrder, util
 from langchain_deepseek import ChatDeepSeek
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+
+# Autonomous system imports
+from observability import get_database, get_tracer
 
 # Setup logging (UTF-8 for Windows console compatibility)
 import sys
@@ -68,9 +74,9 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Exit Parameters
-PROFIT_TARGET_PCT = 15.0  # Take profit at +15%
-STOP_LOSS_PCT = -8.0  # Stop loss at -8%
-FORCE_EXIT_DAYS = 21  # Force review after 21 days (max hold period)
+PROFIT_TARGET_PCT = 15.0  # Review trigger at +15% (not automatic sell)
+STOP_LOSS_PCT = -8.0  # Stop loss at -8% (capital protection)
+FORCE_EXIT_DAYS = 90  # Extended hold review at 90 days (informational, not forced exit)
 CHECK_INTERVAL = 3600  # Check every hour (3600 seconds)
 
 # IBKR Connection
@@ -80,7 +86,7 @@ IBKR_CLIENT_ID = 11  # Unique client ID for exit manager
 
 
 class Form4ExitManager:
-    """Monitor and manage exits for Form 4 positions"""
+    """Monitor and manage exits for Form 4 positions + Autonomous Learning"""
     
     def __init__(self):
         self.output_dir = Path("weekly_bot/form4_reports")
@@ -92,6 +98,14 @@ class Form4ExitManager:
         # Initialize IBKR
         self.ib = None
         self.ibkr_connected = False
+        
+        # Autonomous system components
+        self.agent_name = "form4_strategy"  # Same agent as entry bot
+        # Use absolute path for database (parent directory of weekly_bot)
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        db_path = os.path.join(parent_dir, "databases", "trading_history.db")
+        self.db = get_database(db_path)
+        self.tracer = get_tracer()
         
         # Initialize both LLMs for multi-agent debate
         self.deepseek_llm = None
@@ -116,10 +130,10 @@ class Form4ExitManager:
         if GOOGLE_API_KEY:
             try:
                 self.gemini_llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash-exp",
+                    model="gemini-3-pro-preview",
                     temperature=0.1
                 )
-                logger.info("[OK] Gemini 2.0 Flash initialized")
+                logger.info("[OK] Gemini 3 Pro initialized")
                 print("[+] GEMINI AGENT: Ready for exit analysis")
             except Exception as e:
                 logger.warning(f"Gemini initialization failed: {e}")
@@ -188,70 +202,96 @@ class Form4ExitManager:
         """
         Get current positions from IBKR and match with approved positions
         Returns list of positions with current P&L and status
+        
+        IMPROVED: Evaluates ALL IBKR positions, using tracking data when available
+        but fallback to IBKR avgCost if position not tracked.
         """
         if not self.ibkr_connected:
             logger.error("Not connected to IBKR")
             return []
         
-        approved_data = self.load_approved_positions()
-        if not approved_data:
-            logger.warning("No approved positions to monitor")
+        # Get ALL portfolio positions from IBKR
+        portfolio = self.ib.portfolio()
+        
+        if not portfolio:
+            logger.info("No positions in IBKR portfolio")
             return []
+        
+        # Load approved positions file for additional context (optional)
+        approved_data = self.load_approved_positions()
+        approved_map = {}
+        if approved_data:
+            for approved_pos in approved_data.get('approved_positions', []):
+                approved_map[approved_pos['symbol']] = approved_pos
+        
+        # Load database tracking data (optional)
+        db_positions = {}
+        try:
+            from observability import get_database
+            db = get_database()
+            active_positions = db.get_active_positions(agent_name=self.agent_name)
+            for pos in active_positions:
+                db_positions[pos['symbol']] = pos
+        except Exception as e:
+            logger.debug(f"Database positions unavailable: {e}")
         
         current_positions = []
         
-        # Get portfolio positions from IBKR
-        portfolio = self.ib.portfolio()
-        
-        for approved_pos in approved_data.get('approved_positions', []):
-            symbol = approved_pos['symbol']
-            
-            # Check if execution data exists
-            execution = approved_pos.get('execution')
-            if not execution:
-                logger.warning(f"[SKIP] {symbol}: No execution data")
-                continue
-            
-            # Check if position was filled
-            if execution.get('status') != 'FILLED':
-                logger.warning(f"[SKIP] {symbol}: Status = {execution.get('status')}")
-                continue
-            
-            # Get entry price from execution object
-            entry_price = execution.get('fill_price')
-            if not entry_price:
-                logger.warning(f"[SKIP] {symbol}: No fill price")
-                continue
-            
-            # Get quantity from execution object
-            entry_quantity = execution.get('shares', 0)
-            
-            # Find matching IBKR position
-            ibkr_position = None
-            for pos in portfolio:
-                if pos.contract.symbol == symbol:
-                    ibkr_position = pos
-                    break
-            
-            if not ibkr_position:
-                logger.debug(f"[SOLD] {symbol}: Not in IBKR portfolio (may have been sold)")
-                continue
-            
-            # Calculate P&L and days held
+        # Evaluate EVERY position in IBKR account
+        for ibkr_position in portfolio:
+            symbol = ibkr_position.contract.symbol
             current_price = ibkr_position.marketPrice
             quantity = ibkr_position.position
             
+            # Skip if quantity is zero
+            if quantity == 0:
+                continue
+            
+            # Determine entry price (priority: database > approved file > IBKR avgCost)
+            entry_price = None
+            entry_date = None
+            days_held = 0
+            recommended_hold_days = 14  # Default
+            original_analysis = {}
+            
+            # Try database first (most reliable)
+            if symbol in db_positions:
+                entry_price = db_positions[symbol].get('entry_price')
+                # Column is called 'entry_timestamp' not 'entry_date'
+                entry_date_str = db_positions[symbol].get('entry_timestamp') or db_positions[symbol].get('entry_date')
+                if entry_date_str:
+                    try:
+                        entry_date = datetime.fromisoformat(entry_date_str.replace(' ', 'T'))
+                        days_held = (datetime.now() - entry_date).days
+                        logger.info(f"[DB] {symbol}: Entry {entry_date_str} = {days_held} days held")
+                    except Exception as e:
+                        logger.warning(f"[DB] {symbol}: Failed to parse entry_timestamp '{entry_date_str}': {e}")
+            
+            # Try approved positions file (Form4 strategy)
+            if not entry_price and symbol in approved_map:
+                approved_pos = approved_map[symbol]
+                execution = approved_pos.get('execution', {})
+                if execution.get('status') == 'FILLED':
+                    entry_price = execution.get('fill_price')
+                    recommended_hold_days = approved_pos.get('analysis', {}).get('hold_period_days', 14)
+                    original_analysis = approved_pos.get('analysis', {})
+                    
+                    # Parse entry date
+                    entry_timestamp = approved_data.get('approved_at') or execution.get('timestamp', datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
+                    try:
+                        entry_date = datetime.strptime(entry_timestamp.split('.')[0].replace('T', ' '), '%Y-%m-%d %H:%M:%S')
+                        days_held = (datetime.now() - entry_date).days
+                    except:
+                        pass
+            
+            # Fallback to IBKR avgCost (always available)
+            if not entry_price:
+                entry_price = ibkr_position.averageCost
+                logger.info(f"[IBKR] {symbol}: Using IBKR avgCost ${entry_price:.2f} (no tracking data)")
+            
+            # Calculate P&L
             pnl_dollars = (current_price - entry_price) * quantity
             pnl_pct = ((current_price - entry_price) / entry_price) * 100
-            
-            # Parse entry date from approved_at or execution timestamp
-            entry_timestamp = approved_data.get('approved_at') or execution.get('timestamp', datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
-            # Handle both formats: '2025-11-19 03:26:18' or '2025-11-19T07:08:12.205387'
-            try:
-                entry_date = datetime.strptime(entry_timestamp.split('.')[0].replace('T', ' '), '%Y-%m-%d %H:%M:%S')
-            except:
-                entry_date = datetime.now()
-            days_held = (datetime.now() - entry_date).days
             
             current_positions.append({
                 'symbol': symbol,
@@ -261,9 +301,9 @@ class Form4ExitManager:
                 'pnl_dollars': pnl_dollars,
                 'pnl_pct': pnl_pct,
                 'days_held': days_held,
-                'entry_date': entry_date.strftime('%Y-%m-%d'),
-                'original_analysis': approved_pos.get('analysis', {}),
-                'recommended_hold_days': approved_pos.get('analysis', {}).get('hold_period_days', 14),
+                'entry_date': entry_date.strftime('%Y-%m-%d') if entry_date else 'UNKNOWN',
+                'original_analysis': original_analysis,
+                'recommended_hold_days': recommended_hold_days,
                 'market_value': current_price * quantity,
                 'cost_basis': entry_price * quantity
             })
@@ -341,29 +381,38 @@ class Form4ExitManager:
         symbol = position['symbol']
         logger.info(f"[DEBATE] Multi-agent debate: Should we exit {symbol}?")
         
-        system_prompt = """You are an expert stock analyst making EXIT decisions for insider trading positions.
+        system_prompt = f"""You are an expert equity analyst evaluating whether to HOLD or SELL a position.
 
-Analyze whether to HOLD or SELL based on:
-1. PROFIT/LOSS: Current P&L vs targets
-2. TIME: Days held vs recommended hold period
-3. INSIDER ACTIVITY: Any new selling (reversal signal)?
-4. NEWS: Any negative developments?
-5. ORIGINAL THESIS: Is it still valid?
+CRITICAL GUIDELINES - FINANCIALLY INTELLIGENT EXITS ONLY:
+1. CAPITAL PROTECTION: Stop loss at {STOP_LOSS_PCT}% is absolute - protects capital from further losses
+2. THESIS VALIDITY: Is the original investment thesis still intact? If yes, consider holding.
+3. MOMENTUM & UPSIDE: If position profitable, does momentum continue or is upside exhausted?
+4. INSIDER ACTIVITY: New insider selling = thesis reversal, strong sell signal
+5. NEWS IMPACT: Negative developments that break the investment case?
+6. OPPORTUNITY COST: Are there SIGNIFICANTLY better opportunities that justify liquidating this winner?
 
-KEY DECISION FACTORS:
-- Profit target (+15%) = Strong SELL signal
-- Stop loss (-8%) = Immediate SELL
-- Hold period exceeded = Consider exit
+PHILOSOPHY - "LET WINNERS RUN":
+- Profit target (+{PROFIT_TARGET_PCT}%) is a REVIEW TRIGGER, not an automatic sell
+- Only recommend SELL at profit if: (a) Momentum clearly exhausted, OR (b) Thesis deteriorating, OR (c) Superior opportunity available
+- Time held is IRRELEVANT - evaluate on financial merit, not calendar days
+- Holding 10 profitable positions > forcing exits to buy 4 new ones
+- Default to HOLD for profitable positions unless clear financial reason to exit
+
+SELL ONLY WHEN:
+- Stop loss triggered (capital protection)
+- Insider selling + thesis breakdown
+- Profit taken but momentum exhausted AND better opportunity exists
+- Fundamental deterioration makes continued holding risky
 - Insider selling detected = Red flag
 - Original thesis broken = Exit
 
 Return JSON format:
-{
+{{
     "decision": "HOLD" or "SELL",
     "confidence": 0.0-1.0,
     "reasoning": "clear explanation of decision",
     "urgency": "LOW", "MEDIUM", or "HIGH"
-}"""
+}}"""
         
         # Build context
         insider_summary = ""
@@ -425,7 +474,15 @@ Provide your EXIT decision in JSON format."""
         try:
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             gemini_raw = self.gemini_llm.invoke(messages)
-            gemini_text = gemini_raw.content if hasattr(gemini_raw, 'content') else str(gemini_raw)
+            
+            # Handle different response formats from Gemini
+            if hasattr(gemini_raw, 'content'):
+                gemini_text = gemini_raw.content
+                if isinstance(gemini_text, list):
+                    # Gemini 3 Pro returns list of content parts
+                    gemini_text = ' '.join([str(part) if isinstance(part, str) else str(part.get('text', '')) for part in gemini_text])
+            else:
+                gemini_text = str(gemini_raw)
             
             json_match = re.search(r'\{[^{}]*"decision"[^{}]*\}', gemini_text, re.DOTALL)
             if json_match:
@@ -498,14 +555,15 @@ Provide your EXIT decision in JSON format."""
                 'analysis_type': 'RULE_BASED'
             }
         
-        # Profit target reached
+        # Profit target reached - trigger review, don't auto-sell
         if pnl_pct >= PROFIT_TARGET_PCT:
             return {
-                'decision': 'SELL',
-                'confidence': 0.9,
-                'reasoning': f"Profit target reached: {pnl_pct:.1f}% gain exceeds {PROFIT_TARGET_PCT}%",
+                'decision': 'HOLD',  # Changed from SELL to HOLD - let winners run
+                'confidence': 0.6,
+                'reasoning': f"Profit target reached: {pnl_pct:.1f}% gain. Recommend LLM analysis to confirm if upside exhausted or better opportunities available.",
                 'urgency': 'MEDIUM',
-                'analysis_type': 'RULE_BASED'
+                'analysis_type': 'RULE_BASED',
+                'requires_llm_review': True  # Flag for intelligent evaluation
             }
         
         # Hold period exceeded + insider selling
@@ -518,14 +576,15 @@ Provide your EXIT decision in JSON format."""
                 'analysis_type': 'RULE_BASED'
             }
         
-        # Force exit after max hold period
-        if days_held >= FORCE_EXIT_DAYS:
+        # Extended hold period review (informational only, not forced exit)
+        if days_held >= 90:  # Changed from 21 to 90 days - positions held on merit, not calendar
             return {
-                'decision': 'SELL',
-                'confidence': 0.7,
-                'reasoning': f"Maximum hold period reached ({days_held} days >= {FORCE_EXIT_DAYS} days)",
+                'decision': 'HOLD',  # Changed from SELL to HOLD
+                'confidence': 0.5,
+                'reasoning': f"Extended hold period ({days_held} days) - recommend LLM review for thesis validity",
                 'urgency': 'LOW',
-                'analysis_type': 'RULE_BASED'
+                'analysis_type': 'RULE_BASED',
+                'requires_llm_review': True  # Flag for manual evaluation
             }
         
         # Default: HOLD
@@ -574,6 +633,34 @@ Provide your EXIT decision in JSON format."""
                 fill_price = trade.orderStatus.avgFillPrice
                 pnl = (fill_price - position['entry_price']) * quantity
                 pnl_pct = ((fill_price - position['entry_price']) / position['entry_price']) * 100
+                
+                # AUTONOMOUS: Log exit trade to database
+                self.db.log_trade({
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'action': 'SELL',
+                    'quantity': quantity,
+                    'price': fill_price,
+                    'agent_name': self.agent_name,
+                    'reason': decision.get('exit_reason', 'Exit manager decision'),
+                    'profit_loss': pnl,
+                    'profit_loss_pct': pnl_pct,
+                    'metadata': {
+                        'entry_price': position['entry_price'],
+                        'days_held': position['days_held'],
+                        'exit_trigger': decision.get('exit_action', 'UNKNOWN'),
+                        'consensus': decision.get('consensus', 'N/A'),
+                        'current_pnl_pct': position.get('current_pnl_pct', 0)
+                    }
+                })
+                
+                # AUTONOMOUS: Remove from active positions
+                self.db.remove_active_position(
+                    symbol=symbol,
+                    exit_price=fill_price,
+                    exit_reason=decision.get('exit_reason', 'Exit manager'),
+                    agent_name=self.agent_name
+                )
                 
                 logger.info(f"✅ {symbol}: FILLED {quantity} shares @ ${fill_price:.2f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%)")
                 print(f"   [FILLED] ${pnl:.2f} ({pnl_pct:+.1f}%) realized")

@@ -16,47 +16,70 @@ from datetime import datetime
 import pytz
 import logging
 
+def is_market_holiday():
+    """
+    Checks if today is a market holiday (like Thanksgiving, Christmas, etc.)
+    
+    Returns:
+        bool: True if today is a market holiday, False otherwise.
+    """
+    try:
+        nyse = mcal.get_calendar('NYSE')
+        ny_tz = pytz.timezone('America/New_York')
+        today_ny = datetime.now(ny_tz).date()
+        
+        # Get today's schedule
+        schedule = nyse.schedule(start_date=today_ny, end_date=today_ny)
+        
+        # If schedule is empty, it's a holiday or weekend
+        if schedule.empty:
+            # Check if it's a weekend
+            if today_ny.weekday() >= 5:
+                logging.info(f"Today is a weekend ({today_ny.strftime('%A, %Y-%m-%d')})")
+            else:
+                logging.info(f"🚫 Today is a MARKET HOLIDAY ({today_ny.strftime('%A, %Y-%m-%d')})")
+            return True
+        
+        return False
+    except Exception as e:
+        logging.warning(f"Could not check holiday status (assuming market closed): {e}")
+        return True  # Safe default: assume holiday
+
 def is_market_open():
     """
     Checks if the NYSE market is currently open using America/New_York timezone.
-    Simplified to avoid pandas_market_calendars library issues.
+    Accounts for holidays and weekends.
 
     Returns:
         bool: True if the market is open, False otherwise.
     """
     try:
+        nyse = mcal.get_calendar('NYSE')
         ny_tz = pytz.timezone('America/New_York')
         
         # Get the current time in the NYSE timezone
         now_ny = datetime.now(ny_tz)
+        today_ny = now_ny.date()
         
-        # Simple check: weekday (0-4 = Mon-Fri) and between 9:30 AM - 4:00 PM
-        is_weekday = now_ny.weekday() < 5
-        current_time = now_ny.time()
-        market_open_time = datetime.strptime("09:30", "%H:%M").time()
-        market_close_time = datetime.strptime("16:00", "%H:%M").time()
+        # Check if today is a market holiday or weekend
+        schedule = nyse.schedule(start_date=today_ny, end_date=today_ny)
         
-        is_trading_hours = market_open_time <= current_time <= market_close_time
-        
-        if not is_weekday:
-            logging.info(f"Market is closed (weekend). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
+        if schedule.empty:
+            # Market is closed (holiday or weekend)
+            if today_ny.weekday() >= 5:
+                logging.info(f"Market is closed (weekend). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                logging.info(f"🚫 Market is closed (HOLIDAY). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
             return False
         
-        if not is_trading_hours:
-            logging.info(f"Market is closed (outside trading hours). Current NY time: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}")
-            return False
-        
-        # Market is open
-        return True
-
-        # Get market open and close times from the schedule. These are in UTC.
+        # Get market open and close times from the schedule (in UTC)
         market_open_utc = schedule.iloc[0].market_open
         market_close_utc = schedule.iloc[0].market_close
         
-        # Convert them to NY time for a clear log message
+        # Convert to NY time
         market_open_ny = market_open_utc.astimezone(ny_tz)
         market_close_ny = market_close_utc.astimezone(ny_tz)
-
+        
         # Check if current time is within the market hours
         is_open = market_open_ny <= now_ny <= market_close_ny
         

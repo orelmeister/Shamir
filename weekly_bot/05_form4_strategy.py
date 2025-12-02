@@ -25,13 +25,27 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Add parent directory for imports
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # IBKR imports for automatic order execution
 from ib_insync import IB, Stock, MarketOrder, util
 
 # LangChain imports
 from langchain_deepseek import ChatDeepSeek
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    GEMINI_AVAILABLE = True
+except (ImportError, AttributeError) as e:
+    GEMINI_AVAILABLE = False
+    print(f"[WARNING] Gemini unavailable due to library issue: {e}. Using DeepSeek only.")
 from langchain_core.messages import HumanMessage, SystemMessage
+
+# Autonomous system imports
+from observability import get_database, get_tracer
+from self_evaluation import PerformanceAnalyzer
+from continuous_improvement import ContinuousImprovementEngine
 
 # PDF generation imports
 try:
@@ -77,7 +91,7 @@ IBKR_PORT = 4001  # Live trading (Gateway or TWS)
 IBKR_CLIENT_ID = 10  # Unique client ID for Form 4 strategy
 
 class Form4Strategy:
-    """Form 4 Insider Trading Strategy with Manual Approval"""
+    """Form 4 Insider Trading Strategy with Manual Approval + Autonomous Learning"""
     
     def __init__(self):
         self.capital = CAPITAL
@@ -87,6 +101,18 @@ class Form4Strategy:
         # Initialize IBKR connection
         self.ib = None
         self.ibkr_connected = False
+        
+        # Autonomous system components
+        self.agent_name = "form4_strategy"
+        # Use absolute path for database (parent directory of weekly_bot)
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        db_path = os.path.join(parent_dir, "databases", "trading_history.db")
+        self.db = get_database(db_path)
+        self.tracer = get_tracer()
+        self.performance_analyzer = PerformanceAnalyzer(self.agent_name)
+        self.improvement_engine = ContinuousImprovementEngine(self.agent_name)
+        
+        logger.info("✅ Autonomous systems enabled: Observability, Self-Evaluation, Continuous Improvement")
         
         # Initialize BOTH LLMs for multi-agent debate
         self.deepseek_llm = None
@@ -106,7 +132,7 @@ class Form4Strategy:
                 logger.warning(f"DeepSeek Reasoner initialization failed: {e}")
         
         # Initialize Gemini 2.5 Pro
-        if GOOGLE_API_KEY:
+        if GOOGLE_API_KEY and GEMINI_AVAILABLE:
             try:
                 self.gemini_llm = ChatGoogleGenerativeAI(
                     model="gemini-2.0-flash-exp",
@@ -2513,6 +2539,41 @@ Consider:
                         'timestamp': datetime.now().isoformat()
                     }
                     
+                    # AUTONOMOUS: Log trade to database
+                    signal_data = candidate.get('signal_data', {})
+                    self.db.log_trade({
+                        'timestamp': datetime.now().isoformat(),
+                        'symbol': symbol,
+                        'action': 'BUY',
+                        'quantity': fill_shares,
+                        'price': fill_price,
+                        'agent_name': self.agent_name,
+                        'reason': f"Form4 cluster: {signal_data.get('total_signals', 0)} signals, {signal_data.get('politician_count', 0)} politicians",
+                        'metadata': {
+                            'confidence_score': candidate['analysis'].get('confidence', 0),
+                            'filing_count': signal_data.get('total_signals', 0),
+                            'politician_count': signal_data.get('politician_count', 0),
+                            'quality_score': signal_data.get('weighted_quality_score', 0),
+                            'lookback_days': LOOKBACK_DAYS,
+                            'min_filings_threshold': MIN_FILINGS_FOR_CLUSTER,
+                            'target_allocation': candidate['position']['actual_dollars']
+                        }
+                    })
+                    
+                    # AUTONOMOUS: Track position
+                    self.db.add_active_position(
+                        symbol=symbol,
+                        quantity=fill_shares,
+                        entry_price=fill_price,
+                        agent_name=self.agent_name,
+                        profit_target=fill_price * 1.15,  # 15% target
+                        stop_loss=fill_price * 0.90,      # -10% stop
+                        metadata={
+                            'entry_reason': candidate['analysis'].get('insider_narrative', ''),
+                            'politician_involved': signal_data.get('politician_count', 0) > 0
+                        }
+                    )
+                    
                     logger.info(f"✅ {symbol}: FILLED {fill_shares} shares @ ${fill_price:.2f} = ${total_cost:.2f}")
                     print(f"   [FILLED] {fill_shares} shares @ ${fill_price:.2f} = ${total_cost:.2f}")
                     
@@ -2611,6 +2672,7 @@ Consider:
     def run(self):
         """
         Main execution flow with automatic order execution
+        CRITICAL: EXIT FIRST, THEN ENTER - evaluates existing positions before new entries
         """
         logger.info("="*80)
         logger.info("🚀 FORM 4 INSIDER CLUSTER STRATEGY - STARTING")
@@ -2624,6 +2686,32 @@ Consider:
         self.connect_to_ibkr()
         
         try:
+            # STEP 0: Evaluate existing positions for exits FIRST (frees up capital)
+            logger.info("="*80)
+            logger.info("📊 STEP 0: EXIT EVALUATION (runs before entry logic)")
+            logger.info("="*80)
+            try:
+                from form4_exit_manager import Form4ExitManager
+                exit_manager = Form4ExitManager()
+                exit_results = exit_manager.evaluate_all_positions()
+                logger.info(f"✅ Exit evaluation complete: {exit_results}")
+            except Exception as e:
+                logger.error(f"❌ Exit manager failed: {e}", exc_info=True)
+                logger.warning("⚠️  Continuing to entry logic despite exit failure...")
+            
+            # Get updated capital after liquidations
+            if self.ib and self.ib.isConnected():
+                account_summary = self.ib.accountSummary()
+                for item in account_summary:
+                    if item.tag == 'AvailableFunds':
+                        available_cash = float(item.value)
+                        logger.info(f"💰 Available cash after exits: ${available_cash:.2f}")
+                        break
+            
+            logger.info("="*80)
+            logger.info("📈 STEP 1: ENTRY LOGIC (searching for new opportunities)")
+            logger.info("="*80)
+            
             # Step 1: Fetch multi-source insider signals
             multi_source_data = self.fetch_multi_source_signals()
             
@@ -2703,7 +2791,29 @@ Consider:
             else:
                 logger.info("🔒 Orders saved for manual execution (IBKR not connected)")
         
+        except Exception as e:
+            logger.error(f"❌ Error in Form 4 strategy: {e}")
+            raise
         finally:
+            # AUTONOMOUS: Run improvement cycle at end of week
+            if datetime.now().weekday() == 6:  # Sunday
+                logger.info("📊 Running weekly performance analysis and improvement cycle...")
+                try:
+                    improvement_report = self.improvement_engine.daily_improvement_cycle()
+                    
+                    if improvement_report.get('parameter_changes'):
+                        logger.info(f"✅ Parameters updated: {list(improvement_report['parameter_changes'].keys())}")
+                    
+                    if improvement_report.get('llm_insights'):
+                        insights = improvement_report['llm_insights']
+                        if isinstance(insights, dict) and 'assessment' in insights:
+                            logger.info(f"💡 LLM Assessment: {insights['assessment']}")
+                    
+                    logger.info("📁 Weekly improvement report saved")
+                    
+                except Exception as e_improve:
+                    logger.error(f"⚠️ Error in improvement cycle: {e_improve}")
+            
             # Always disconnect from IBKR
             self.disconnect_from_ibkr()
 
