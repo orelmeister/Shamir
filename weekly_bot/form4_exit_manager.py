@@ -27,10 +27,12 @@ import sys
 import json
 import logging
 import requests
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
@@ -92,6 +94,8 @@ class Form4ExitManager:
         self.output_dir = Path("weekly_bot/form4_reports")
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
+        self.reports_dir = self.output_dir  # Alias for consolidated reports
+        
         self.exit_log_dir = Path("weekly_bot/form4_reports/exit_logs")
         self.exit_log_dir.mkdir(exist_ok=True, parents=True)
         
@@ -140,7 +144,8 @@ class Form4ExitManager:
         
         if self.deepseek_llm and self.gemini_llm:
             self.multi_agent_available = True
-            print("[+] MULTI-AGENT DEBATE: ENABLED for exit decisions\n")
+            print("[+] MULTI-AGENT DEBATE: ENABLED for exit decisions")
+            print("[+] PARALLEL ANALYSIS: Enabled (analyze multiple positions simultaneously)\n")
         else:
             logger.warning("[WARN] Multi-agent debate not available - using single LLM or rule-based")
             print("[!] WARNING: Limited exit analysis without both LLMs\n")
@@ -174,6 +179,203 @@ class Form4ExitManager:
             except Exception as e:
                 logger.warning(f"Error disconnecting: {e}")
     
+    def sync_positions_from_ibkr(self) -> Dict:
+        """
+        Sync ALL positions from IBKR to database and verify data quality
+        
+        This fixes the bug where exit manager was blind to 13 orphaned positions.
+        
+        Returns: Dict with sync statistics and warnings
+        """
+        if not self.ibkr_connected:
+            return {'error': 'Not connected to IBKR'}
+        
+        print("\n" + "="*80)
+        print("[SYNC] IBKR POSITION RECONCILIATION")
+        print("="*80 + "\n")
+        
+        # Get ALL positions from IBKR (ground truth)
+        portfolio = self.ib.portfolio()
+        ibkr_positions = [p for p in portfolio if p.position != 0]
+        
+        print(f"[IBKR] {len(ibkr_positions)} active positions in account\n")
+        
+        # Load approved positions files to get actual entry dates
+        print("[LOADING] Scanning approved_positions_*.json files for entry dates...\n")
+        approved_map = {}
+        try:
+            position_files = sorted(
+                self.output_dir.glob("approved_positions_*.json"),
+                key=lambda p: p.stat().st_mtime
+            )
+            for pf in position_files:
+                with open(pf, 'r') as f:
+                    data = json.load(f)
+                    for pos in data.get('approved_positions', []):
+                        symbol = pos['symbol']
+                        execution = pos.get('execution', {})
+                        if execution.get('status') == 'FILLED' and symbol not in approved_map:
+                            # Store first (oldest) entry for each symbol
+                            approved_map[symbol] = {
+                                'entry_price': execution.get('fill_price'),
+                                'entry_timestamp': execution.get('timestamp'),
+                                'source_file': pf.name
+                            }
+            print(f"[OK] Found entry data for {len(approved_map)} symbols from historical files\n")
+        except Exception as e:
+            logger.warning(f"Failed to load approved positions: {e}")
+            print(f"[WARNING] Could not load historical entry dates: {e}\n")
+        
+        # Get tracked positions from database
+        db_positions = {}
+        try:
+            active_db = self.db.get_active_positions(agent_name=self.agent_name)
+            db_positions = {p['symbol']: p for p in active_db}
+            print(f"[DATABASE] {len(db_positions)} positions tracked\n")
+        except Exception as e:
+            logger.error(f"Failed to query database: {e}")
+            print(f"[ERROR] Database query failed: {e}\n")
+        
+        # Statistics
+        stats = {
+            'ibkr_total': len(ibkr_positions),
+            'db_tracked': len(db_positions),
+            'orphaned': 0,
+            'verified': 0,
+            'missing_data': [],
+            'today_purchases': [],
+            'ready_for_exit': 0
+        }
+        
+        today = datetime.now().date()
+        
+        # Analyze each IBKR position
+        for ibkr_pos in ibkr_positions:
+            symbol = ibkr_pos.contract.symbol
+            quantity = ibkr_pos.position
+            avg_cost = ibkr_pos.averageCost
+            market_value = quantity * ibkr_pos.marketPrice
+            
+            print(f"[CHECKING] {symbol}: {quantity} shares @ ${avg_cost:.2f}")
+            
+            # Check if tracked in database
+            if symbol not in db_positions:
+                stats['orphaned'] += 1
+                print(f"  [ORPHANED] Not in database - EXIT MANAGER CANNOT MANAGE THIS!")
+                
+                # Try to get actual entry date from approved positions files
+                entry_timestamp = datetime.now().isoformat()
+                entry_source = "IBKR_SYNC_FALLBACK"
+                
+                if symbol in approved_map:
+                    approved_info = approved_map[symbol]
+                    if approved_info.get('entry_timestamp'):
+                        entry_timestamp = approved_info['entry_timestamp']
+                        entry_source = approved_info['source_file']
+                        print(f"  [FOUND] Entry date from {entry_source}")
+                        print(f"  [DATE] {entry_timestamp}")
+                    if approved_info.get('entry_price'):
+                        # Use exact fill price from file instead of avgCost
+                        avg_cost = approved_info['entry_price']
+                        print(f"  [PRICE] Using exact fill price: ${avg_cost:.2f}")
+                else:
+                    print(f"  [WARNING] No historical entry found - using current timestamp")
+                    print(f"  [ACTION] Position will show as 'purchased today' until manually corrected")
+                
+                print(f"  [ACTION] Adding to database...")
+                
+                # Add to database with best available data
+                try:
+                    self.db.log_trade({
+                        'symbol': symbol,
+                        'action': 'BUY',
+                        'quantity': quantity,
+                        'price': avg_cost,
+                        'timestamp': entry_timestamp,
+                        'reason': 'ORPHANED_POSITION_SYNC',
+                        'agent_name': self.agent_name,
+                        'metadata': {
+                            'synced_from_ibkr': True,
+                            'entry_source': entry_source,
+                            'market_value': market_value,
+                            'note': 'Position existed in IBKR but not tracked - added for exit management'
+                        }
+                    })
+                    print(f"  [OK] Added to database\n")
+                    stats['verified'] += 1
+                except Exception as e:
+                    logger.error(f"Failed to add {symbol} to database: {e}")
+                    print(f"  [ERROR] Database insert failed: {e}\n")
+                    stats['missing_data'].append(symbol)
+                continue
+            
+            # Verify database data quality
+            db_pos = db_positions[symbol]
+            entry_price = db_pos.get('entry_price')
+            entry_date_str = db_pos.get('entry_timestamp') or db_pos.get('entry_date')
+            
+            # Check for missing purchase data
+            if not entry_price or entry_price <= 0:
+                print(f"  [WARNING] Missing entry price in database!")
+                stats['missing_data'].append(symbol)
+            
+            if not entry_date_str:
+                print(f"  [WARNING] Missing entry date in database!")
+                stats['missing_data'].append(symbol)
+            else:
+                # Parse entry date and check if purchased today
+                try:
+                    entry_date = datetime.fromisoformat(entry_date_str.replace(' ', 'T')).date()
+                    days_held = (today - entry_date).days
+                    
+                    if entry_date == today:
+                        stats['today_purchases'].append(symbol)
+                        print(f"  [TODAY] Purchased TODAY - WILL BE IGNORED by exit manager")
+                        print(f"  [INFO] Let it develop before analysis\n")
+                    else:
+                        # Calculate gain %
+                        current_price = ibkr_pos.marketPrice
+                        gain_pct = ((current_price - entry_price) / entry_price) * 100
+                        
+                        print(f"  [OK] Entry: ${entry_price:.2f} on {entry_date}")
+                        print(f"  [OK] Days held: {days_held}, Gain: {gain_pct:+.2f}%")
+                        print(f"  [READY] Available for exit analysis\n")
+                        
+                        stats['verified'] += 1
+                        stats['ready_for_exit'] += 1
+                except Exception as e:
+                    logger.error(f"Error parsing date for {symbol}: {e}")
+                    print(f"  [ERROR] Date parse failed: {e}\n")
+                    stats['missing_data'].append(symbol)
+            
+            if entry_price and not (symbol in stats['missing_data'] or symbol in stats['today_purchases']):
+                stats['verified'] += 1
+        
+        # Print summary
+        print("="*80)
+        print("[SUMMARY] POSITION SYNC RESULTS")
+        print("="*80)
+        print(f"  Total IBKR Positions: {stats['ibkr_total']}")
+        print(f"  Database Tracked: {stats['db_tracked']}")
+        print(f"  Orphaned (Fixed): {stats['orphaned']}")
+        print(f"  Verified with Data: {stats['verified']}")
+        print(f"  Purchased Today (Ignored): {len(stats['today_purchases'])}")
+        print(f"  Ready for Exit Analysis: {stats['ready_for_exit']}")
+        
+        if stats['missing_data']:
+            print(f"\n  [WARNING] {len(stats['missing_data'])} positions missing purchase data:")
+            for sym in stats['missing_data']:
+                print(f"    - {sym}")
+        
+        if stats['today_purchases']:
+            print(f"\n  [IGNORED] {len(stats['today_purchases'])} today's purchases:")
+            for sym in stats['today_purchases']:
+                print(f"    - {sym}")
+        
+        print("="*80 + "\n")
+        
+        return stats
+    
     def load_approved_positions(self) -> Dict:
         """Load most recent approved positions file"""
         try:
@@ -198,13 +400,16 @@ class Form4ExitManager:
             logger.error(f"Failed to load approved positions: {e}")
             return {}
     
-    def get_current_positions(self) -> List[Dict]:
+    def get_current_positions(self, ignore_today: bool = True) -> List[Dict]:
         """
         Get current positions from IBKR and match with approved positions
         Returns list of positions with current P&L and status
         
         IMPROVED: Evaluates ALL IBKR positions, using tracking data when available
         but fallback to IBKR avgCost if position not tracked.
+        
+        Args:
+            ignore_today: If True, filter out positions purchased today (default=True)
         """
         if not self.ibkr_connected:
             logger.error("Not connected to IBKR")
@@ -261,8 +466,16 @@ class Form4ExitManager:
                 entry_date_str = db_positions[symbol].get('entry_timestamp') or db_positions[symbol].get('entry_date')
                 if entry_date_str:
                     try:
+                        # Parse timezone-aware datetime
                         entry_date = datetime.fromisoformat(entry_date_str.replace(' ', 'T'))
-                        days_held = (datetime.now() - entry_date).days
+                        
+                        # Make both datetimes timezone-aware for comparison
+                        now_aware = datetime.now(timezone.utc)
+                        if entry_date.tzinfo is None:
+                            # If entry_date is naive, assume UTC
+                            entry_date = entry_date.replace(tzinfo=timezone.utc)
+                        
+                        days_held = (now_aware - entry_date).days
                         logger.info(f"[DB] {symbol}: Entry {entry_date_str} = {days_held} days held")
                     except Exception as e:
                         logger.warning(f"[DB] {symbol}: Failed to parse entry_timestamp '{entry_date_str}': {e}")
@@ -279,8 +492,14 @@ class Form4ExitManager:
                     # Parse entry date
                     entry_timestamp = approved_data.get('approved_at') or execution.get('timestamp', datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
                     try:
-                        entry_date = datetime.strptime(entry_timestamp.split('.')[0].replace('T', ' '), '%Y-%m-%d %H:%M:%S')
-                        days_held = (datetime.now() - entry_date).days
+                        entry_date = datetime.fromisoformat(entry_timestamp.split('.')[0].replace(' ', 'T'))
+                        
+                        # Make timezone-aware for comparison
+                        now_aware = datetime.now(timezone.utc)
+                        if entry_date.tzinfo is None:
+                            entry_date = entry_date.replace(tzinfo=timezone.utc)
+                        
+                        days_held = (now_aware - entry_date).days
                     except:
                         pass
             
@@ -289,9 +508,25 @@ class Form4ExitManager:
                 entry_price = ibkr_position.averageCost
                 logger.info(f"[IBKR] {symbol}: Using IBKR avgCost ${entry_price:.2f} (no tracking data)")
             
+            # Filter out today's purchases if requested
+            if ignore_today and entry_date:
+                # Compare dates using timezone-aware datetime
+                today = datetime.now(timezone.utc).date()
+                entry_day = entry_date.date() if hasattr(entry_date, 'date') else entry_date
+                
+                if entry_day == today:
+                    logger.info(f"[SKIP] {symbol}: Purchased today - ignoring for exit analysis")
+                    continue
+            
             # Calculate P&L
             pnl_dollars = (current_price - entry_price) * quantity
             pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            
+            # SKIP positions entered today (days_held = 0) - let them mature at least 1 day
+            if days_held == 0:
+                logger.info(f"⏭️  {symbol}: SKIPPING - Entered today (need 1+ days to evaluate)")
+                print(f"   ⏭️  {symbol}: Position entered today - will evaluate tomorrow")
+                continue
             
             current_positions.append({
                 'symbol': symbol,
@@ -537,6 +772,109 @@ Provide your EXIT decision in JSON format."""
                 'analysis_type': 'MULTI_AGENT_DISAGREE'
             }
     
+    def _analyze_position(self, position: Dict, insider_activity: Dict, news: List[Dict]) -> Dict:
+        """
+        Analyze a single position using multi-agent debate (waits as long as needed)
+        
+        Args:
+            position: Position data
+            insider_activity: Recent insider activity
+            news: Recent news articles
+        
+        Returns: Analysis decision dict
+        """
+        symbol = position['symbol']
+        
+        try:
+            # Call multi-agent debate directly - no timeout
+            decision = self.multi_agent_exit_debate(
+                position,
+                insider_activity,
+                news
+            )
+            return decision
+        
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {e}")
+            return self._rule_based_exit_decision(position, insider_activity)
+    
+    def analyze_positions_parallel(self, positions: List[Dict], max_workers: int = 3) -> List[Dict]:
+        """
+        Analyze multiple positions in parallel to reduce total evaluation time
+        
+        Args:
+            positions: List of position dicts
+            max_workers: Maximum parallel workers (default 3 to avoid API rate limits)
+        
+        Returns: List of analysis results
+        """
+        print(f"\n[PARALLEL] Analyzing {len(positions)} positions with {max_workers} workers\n")
+        
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all analysis tasks
+            future_to_position = {}
+            
+            for position in positions:
+                symbol = position['symbol']
+                
+                # Prepare data for this position
+                print(f"[QUEUED] {symbol}: Fetching data...")
+                insider_activity = self.check_for_insider_selling(symbol, days=7)
+                news = self.get_recent_news(symbol, days=7)
+                
+                # Submit analysis task (no timeout - waits as long as needed)
+                future = executor.submit(
+                    self._analyze_position,
+                    position,
+                    insider_activity,
+                    news
+                )
+                
+                future_to_position[future] = {
+                    'position': position,
+                    'insider_activity': insider_activity,
+                    'news': news
+                }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_position):
+                context = future_to_position[future]
+                position = context['position']
+                symbol = position['symbol']
+                
+                try:
+                    decision = future.result()
+                    
+                    print(f"\n[COMPLETE] {symbol}:")
+                    print(f"   Decision: {decision['decision']} ({decision['confidence']:.0%} confidence)")
+                    print(f"   Reasoning: {decision['reasoning'][:100]}...")
+                    
+                    results.append({
+                        'position': position,
+                        'decision': decision,
+                        'insider_activity': context['insider_activity'],
+                        'news': context['news']
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Failed to get result for {symbol}: {e}")
+                    # Fallback to rule-based
+                    decision = self._rule_based_exit_decision(
+                        position,
+                        context['insider_activity']
+                    )
+                    results.append({
+                        'position': position,
+                        'decision': decision,
+                        'insider_activity': context['insider_activity'],
+                        'news': context['news']
+                    })
+        
+        print(f"\n[PARALLEL] All {len(results)} positions analyzed\n")
+        return results
+    
     def _rule_based_exit_decision(self, position: Dict, insider_activity: Dict) -> Dict:
         """
         Fallback rule-based exit decision when LLMs unavailable
@@ -700,6 +1038,50 @@ Provide your EXIT decision in JSON format."""
         
         logger.info(f"[LOG] Exit log saved: {log_file.name}")
     
+    def save_daily_analysis_report(self, exit_decisions: List[Dict], total_realized_pnl: float):
+        """Save consolidated daily exit analysis report (avoids redundant AI calls)"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        
+        report_data = {
+            'date': date_str,
+            'timestamp': datetime.now().isoformat(),
+            'positions_analyzed': len(exit_decisions),
+            'sell_decisions': sum(1 for d in exit_decisions if d['decision']['decision'] == 'SELL'),
+            'hold_decisions': sum(1 for d in exit_decisions if d['decision']['decision'] == 'HOLD'),
+            'total_realized_pnl': total_realized_pnl,
+            'exit_decisions': exit_decisions
+        }
+        
+        report_file = self.reports_dir / f"exit_analysis_{timestamp}.json"
+        with open(report_file, 'w') as f:
+            json.dump(report_data, f, indent=2)
+        
+        logger.info(f"[REPORT] Daily exit analysis saved: {report_file.name}")
+        print(f"\n📄 Exit analysis report saved: {report_file.name}")
+        return report_file
+    
+    def load_todays_analysis(self) -> Optional[Dict]:
+        """Check if exit analysis already ran today (avoid redundant AI calls)"""
+        today_str = datetime.now().strftime("%Y%m%d")
+        
+        # Find today's exit analysis files
+        pattern = f"exit_analysis_{today_str}_*.json"
+        matching_files = sorted(self.reports_dir.glob(pattern), reverse=True)
+        
+        if matching_files:
+            latest_file = matching_files[0]
+            logger.info(f"[CACHE] Found existing exit analysis: {latest_file.name}")
+            
+            try:
+                with open(latest_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load existing analysis: {e}")
+                return None
+        
+        return None
+    
     def run(self, dry_run: bool = False):
         """
         Main monitoring loop
@@ -714,46 +1096,97 @@ Provide your EXIT decision in JSON format."""
         print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*80 + "\n")
         
+        logger.info(f"[START] Exit manager running (dry_run={dry_run})")
+        
         # Connect to IBKR
+        print("[+] Connecting to IBKR...")
         if not self.connect_to_ibkr():
-            logger.error("Cannot proceed without IBKR connection")
-            return
+            logger.error("❌ Cannot proceed without IBKR connection")
+            print("❌ IBKR connection failed - cannot monitor positions")
+            print(f"   Host: {IBKR_HOST}:{IBKR_PORT}")
+            print(f"   Client ID: {IBKR_CLIENT_ID}")
+            print("\n💡 Make sure TWS/Gateway is running and accepting connections.")
+            return {'error': 'IBKR connection failed'}
+        
+        # CRITICAL: Sync ALL IBKR positions to database first
+        print("[+] Syncing positions from IBKR...")
+        sync_stats = self.sync_positions_from_ibkr()
+        
+        if sync_stats.get('error'):
+            logger.error(f"Position sync failed: {sync_stats['error']}")
+            return {'error': 'Position sync failed'}
+        
+        if sync_stats.get('ready_for_exit', 0) == 0:
+            logger.info("✅ No positions ready for exit analysis")
+            print("\n✅ No positions ready for exit analysis")
+            if sync_stats.get('today_purchases'):
+                print(f"   {len(sync_stats['today_purchases'])} purchased today - will analyze tomorrow")
+            return {'status': 'no_positions_ready', 'sync_stats': sync_stats}
         
         try:
-            # Get current positions
-            positions = self.get_current_positions()
+            # Get current positions (ignore today's purchases)
+            print("[+] Retrieving portfolio positions...")
+            logger.info("[POSITIONS] Fetching portfolio from IBKR...")
+            positions = self.get_current_positions(ignore_today=True)
             
             if not positions:
-                logger.info("No positions to monitor")
-                print("[INFO] No open positions found")
-                return
+                logger.info("✅ No positions to monitor (empty portfolio)")
+                print("\n✅ No open positions found")
+                print("   Portfolio is empty or all positions already exited.")
+                return {'status': 'no_positions', 'positions_count': 0}
             
             logger.info(f"[MONITOR] {len(positions)} position(s)")
             print(f"\n[MONITORING] {len(positions)} position(s)\n")
             
+            # PARALLEL ANALYSIS: Analyze all positions concurrently
+            if self.multi_agent_available and len(positions) > 1:
+                # Use parallel analysis for multiple positions
+                analysis_results = self.analyze_positions_parallel(
+                    positions,
+                    max_workers=min(3, len(positions))  # Max 3 workers to avoid API rate limits
+                )
+            else:
+                # Sequential analysis for single position or without LLMs
+                analysis_results = []
+                for position in positions:
+                    symbol = position['symbol']
+                    print("="*80)
+                    print(f"ANALYZING: {symbol}")
+                    print("="*80)
+                    print(f"Entry: ${position['entry_price']:.2f} | Current: ${position['current_price']:.2f}")
+                    print(f"P&L: ${position['pnl_dollars']:.2f} ({position['pnl_pct']:+.1f}%)")
+                    print(f"Days Held: {position['days_held']} / {position['recommended_hold_days']}")
+                    print()
+                    
+                    insider_activity = self.check_for_insider_selling(symbol, days=7)
+                    news = self.get_recent_news(symbol, days=7)
+                    
+                    if self.multi_agent_available:
+                        decision = self._analyze_position(position, insider_activity, news)
+                    else:
+                        decision = self._rule_based_exit_decision(position, insider_activity)
+                    
+                    analysis_results.append({
+                        'position': position,
+                        'decision': decision,
+                        'insider_activity': insider_activity,
+                        'news': news
+                    })
+            
+            # Process analysis results and execute trades
             exit_decisions = []
             
-            for position in positions:
+            for result in analysis_results:
+                position = result['position']
+                decision = result['decision']
                 symbol = position['symbol']
+                
                 print("="*80)
-                print(f"ANALYZING: {symbol}")
+                print(f"PROCESSING: {symbol}")
                 print("="*80)
                 print(f"Entry: ${position['entry_price']:.2f} | Current: ${position['current_price']:.2f}")
                 print(f"P&L: ${position['pnl_dollars']:.2f} ({position['pnl_pct']:+.1f}%)")
                 print(f"Days Held: {position['days_held']} / {position['recommended_hold_days']}")
-                print()
-                
-                # Check for insider selling
-                insider_activity = self.check_for_insider_selling(symbol, days=7)
-                
-                # Get recent news
-                news = self.get_recent_news(symbol, days=7)
-                
-                # Multi-agent debate for exit decision
-                if self.multi_agent_available:
-                    decision = self.multi_agent_exit_debate(position, insider_activity, news)
-                else:
-                    decision = self._rule_based_exit_decision(position, insider_activity)
                 
                 print(f"\n[DECISION] {decision['decision']} (confidence: {decision['confidence']:.0%})")
                 print(f"[REASONING] {decision['reasoning']}")
@@ -764,7 +1197,14 @@ Provide your EXIT decision in JSON format."""
                 
                 # Execute if SELL decision
                 if decision['decision'] == 'SELL':
-                    if dry_run:
+                    # CRITICAL: Double-check days_held before execution (prevent same-day liquidation)
+                    if position.get('days_held', 0) == 0:
+                        logger.warning(f"⚠️  {symbol}: BLOCKING SELL - Position entered today (days_held=0)")
+                        print(f"\n⏭️  [BLOCKED] {symbol}: Position entered today - will not sell until tomorrow")
+                        print(f"   Reason: Same-day protection (days_held = {position.get('days_held', 0)})")
+                        execution = {'status': 'BLOCKED_SAME_DAY', 'reason': 'Position entered today'}
+                        decision['decision'] = 'HOLD'  # Override to HOLD
+                    elif dry_run:
                         print(f"\n[DRY RUN] Would sell {position['quantity']} shares of {symbol}")
                         execution = {'status': 'DRY_RUN'}
                     else:
@@ -812,6 +1252,19 @@ Provide your EXIT decision in JSON format."""
                 print(f"\nTotal Realized P&L: ${total_realized_pnl:.2f}")
             
             print("="*80 + "\n")
+            
+            # Save consolidated daily report (avoids redundant AI analysis)
+            if exit_decisions:
+                self.save_daily_analysis_report(exit_decisions, total_realized_pnl)
+            
+            # Return summary of what happened
+            return {
+                'status': 'completed',
+                'positions_analyzed': len(analysis_results),
+                'exit_decisions': exit_decisions,
+                'total_realized_pnl': total_realized_pnl,
+                'timestamp': datetime.now().isoformat()
+            }
             
         finally:
             self.disconnect_from_ibkr()

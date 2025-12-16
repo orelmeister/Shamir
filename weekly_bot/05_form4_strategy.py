@@ -20,6 +20,7 @@ from collections import defaultdict, Counter
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -131,17 +132,28 @@ class Form4Strategy:
             except Exception as e:
                 logger.warning(f"DeepSeek Reasoner initialization failed: {e}")
         
-        # Initialize Gemini 2.5 Pro
+        # Initialize Gemini 2.5 Flash (try standard first, fallback to lite)
         if GOOGLE_API_KEY and GEMINI_AVAILABLE:
             try:
+                # Try gemini-2.5-flash first (best price-performance, higher quota)
                 self.gemini_llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash-exp",
+                    model="gemini-2.5-flash",
                     temperature=0.1
                 )
-                logger.info("✓ Initialized Gemini 2.0 Flash")
-                print("[+] GEMINI AGENT: Ready")
+                logger.info("✓ Initialized Gemini 2.5 Flash")
+                print("[+] GEMINI AGENT: Ready (Gemini 2.5 Flash)")
             except Exception as e:
-                logger.warning(f"Gemini 2.0 Flash initialization failed: {e}")
+                logger.warning(f"Gemini 2.5 Flash initialization failed: {e}")
+                # Fallback to gemini-2.5-flash-lite (faster, more cost-efficient)
+                try:
+                    self.gemini_llm = ChatGoogleGenerativeAI(
+                        model="gemini-2.5-flash-lite",
+                        temperature=0.1
+                    )
+                    logger.info("✓ Initialized Gemini 2.5 Flash-Lite (fallback)")
+                    print("[+] GEMINI AGENT: Ready (Gemini 2.5 Flash-Lite)")
+                except Exception as e2:
+                    logger.warning(f"Gemini 2.5 Flash-Lite initialization also failed: {e2}")
         
         # Check if multi-agent debate available
         if self.deepseek_llm and self.gemini_llm:
@@ -211,6 +223,47 @@ class Form4Strategy:
                 logger.info("🔌 Disconnected from IBKR")
             except Exception as e:
                 logger.warning(f"Error disconnecting from IBKR: {e}")
+    
+    def get_buying_power(self) -> float:
+        """Get available buying power from IBKR using ExcessLiquidity (bypasses T+2 settlement)"""
+        if not self.ibkr_connected:
+            return 0.0
+        
+        try:
+            account_values = self.ib.accountValues()
+            for av in account_values:
+                if av.tag == 'ExcessLiquidity' and av.currency == 'USD':
+                    buying_power = float(av.value)
+                    logger.info(f"💰 IBKR Buying Power (ExcessLiquidity): ${buying_power:.2f}")
+                    return buying_power
+            
+            logger.warning("ExcessLiquidity not found in account values")
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error fetching buying power: {e}")
+            return 0.0
+    
+    def is_complex_etf(self, symbol: str, contract) -> bool:
+        """Check if stock is a complex/leveraged ETF requiring special permissions"""
+        # Known complex ETFs that require special permissions
+        complex_etfs = {
+            'BITB', 'BITO', 'BTF',  # Bitcoin ETFs
+            'SQQQ', 'TQQQ', 'UPRO', 'SPXU',  # 3x leveraged
+            'UVXY', 'SVXY',  # Volatility products
+        }
+        
+        if symbol in complex_etfs:
+            return True
+        
+        # Check contract details if available
+        try:
+            if hasattr(contract, 'secType') and contract.secType == 'ETF':
+                # Additional checks could go here
+                pass
+        except:
+            pass
+        
+        return False
     
     def fetch_multi_source_signals(self) -> Dict[str, List[Dict]]:
         """
@@ -874,6 +927,13 @@ class Form4Strategy:
                 filtered_reasons['price_too_high'] += 1
                 continue
             
+            # Filter out ETFs (user request: focus on stocks only)
+            is_etf = profile.get('isEtf', False)
+            if is_etf:
+                filtered_reasons['is_etf'] += 1
+                logger.debug(f"  ✗ {symbol}: ETF (focus on stocks only)")
+                continue
+            
             # Analyze timing for most recent transaction
             recent_txn = sorted(signal_data['transactions'], 
                               key=lambda t: t.get('date', '2000-01-01'), 
@@ -1140,135 +1200,115 @@ Do you maintain your confidence or adjust based on this perspective? Return upda
             'requires_human_review': agreement_score < 0.70
         }
     
-    def analyze_with_llm(self, candidates: List[Dict]) -> List[Dict]:
+    def _analyze_single_candidate(self, candidate: Dict) -> Dict:
         """
-        Use multi-agent debate or single LLM to analyze candidates
-        Falls back to rule-based scoring if no LLM available
+        Analyze a single candidate (used for parallel processing)
+        Returns: Candidate dict with 'analysis' field added
         """
+        symbol = candidate['symbol']
+        profile = candidate['profile']
+        signal_data = candidate['signal_data']
+        timing_analysis = candidate['timing_analysis']
+        
+        # Fetch news for analysis
+        news = self.get_news(symbol, days=14)
+        
+        # If multi-agent available, use debate
         if self.multi_agent_available:
-            logger.info(f"🤖 Multi-agent debate analysis for {len(candidates)} candidates...")
-            print("\n" + "="*80)
-            print("[MULTI-AGENT DEBATE] ANALYZING CANDIDATES")
-            print("="*80)
-        else:
-            logger.info(f"🤖 Analyzing {len(candidates)} candidates...")
-        
-        analyzed = []
-        
-        for candidate in candidates:
-            symbol = candidate['symbol']
-            profile = candidate['profile']
-            signal_data = candidate['signal_data']
-            timing_analysis = candidate['timing_analysis']
+            debate_result = self.multi_agent_debate(
+                symbol, profile, signal_data, timing_analysis, news
+            )
             
-            # Fetch news for analysis
-            news = self.get_news(symbol, days=14)
-            
-            # If multi-agent available, use debate
-            if self.multi_agent_available:
-                debate_result = self.multi_agent_debate(
-                    symbol, profile, signal_data, timing_analysis, news
-                )
-                
-                if debate_result:
-                    candidate['analysis'] = {
-                        **debate_result,
-                        'analysis_type': 'MULTI-AGENT DEBATE'
-                    }
-                    analyzed.append(candidate)
-                    logger.info(f"  ✓ {symbol}: Consensus {debate_result['confidence']:.2f} (agreement: {debate_result['agreement_score']:.2f})")
-                    continue
-                else:
-                    # Debate failed, fall back to rule-based
-                    logger.warning(f"  ! {symbol}: Debate failed, using rule-based")
-            
-            # Single LLM or no LLM - use previous logic
-            # If no LLM at all, use rule-based scoring
-            if not self.deepseek_llm and not self.gemini_llm:
-                confidence = self._rule_based_score_multi_source(candidate)
-                
-                reasoning = (
-                    f"{signal_data['total_signals']} insider signals (Quality: {signal_data['weighted_quality_score']}/3.0). "
-                    f"Politicians: {signal_data['politician_count']}, Directors: {signal_data['director_count']}, "
-                    f"Officers: {signal_data['officer_count']}. {timing_analysis['timing_status']}"
-                )
-                
-                bull_case = (
-                    f"Multi-source validation with {signal_data['total_signals']} independent signals. "
-                    f"Signal quality {signal_data['weighted_quality_score']}/3.0 indicates strong conviction."
-                )
-                
-                bear_case = "Rule-based analysis only (no LLM). Limited fundamental context."
-                
+            if debate_result:
                 candidate['analysis'] = {
-                    'confidence': confidence,
-                    'reasoning': reasoning,
-                    'bull_case': bull_case,
-                    'bear_case': bear_case,
-                    'hold_period_days': 14,
-                    'analysis_type': 'RULE-BASED (No LLM)'
+                    **debate_result,
+                    'analysis_type': 'MULTI-AGENT DEBATE'
                 }
-                analyzed.append(candidate)
-                logger.info(f"  ✓ {symbol}: Confidence {confidence:.2f} (rule-based)")
-                continue
+                logger.info(f"  ✓ {symbol}: Consensus {debate_result['confidence']:.2f} (agreement: {debate_result['agreement_score']:.2f})")
+                return candidate
+            else:
+                # Debate failed, fall back to rule-based
+                logger.warning(f"  ! {symbol}: Debate failed, using rule-based")
+        
+        # Single LLM or no LLM - use previous logic
+        # If no LLM at all, use rule-based scoring
+        if not self.deepseek_llm and not self.gemini_llm:
+            confidence = self._rule_based_score_multi_source(candidate)
             
-            # Fetch recent news for LLM analysis
-            news = self.get_news(symbol, days=14)
+            reasoning = (
+                f"{signal_data['total_signals']} insider signals (Quality: {signal_data['weighted_quality_score']}/3.0). "
+                f"Politicians: {signal_data['politician_count']}, Directors: {signal_data['director_count']}, "
+                f"Officers: {signal_data['officer_count']}. {timing_analysis['timing_status']}"
+            )
             
-            # Build detailed insider breakdown
-            signal_data = candidate['signal_data']
-            timing_analysis = candidate['timing_analysis']
+            bull_case = (
+                f"Multi-source validation with {signal_data['total_signals']} independent signals. "
+                f"Signal quality {signal_data['weighted_quality_score']}/3.0 indicates strong conviction."
+            )
             
-            # Format transaction details by source
-            politician_txns = [t for t in signal_data['transactions'] if t['source'] in ['senate', 'house']]
-            director_txns = [t for t in signal_data['transactions'] if 'director' in t.get('role', '').lower()]
-            officer_txns = [t for t in signal_data['transactions'] if 'officer' in t.get('role', '').lower()]
+            bear_case = "Rule-based analysis only (no LLM). Limited fundamental context."
             
-            # Build insider details section
-            insider_details = []
-            
-            if politician_txns:
-                insider_details.append("🏛️  POLITICIAN PURCHASES (HIGHEST CONFIDENCE):")
-                for txn in politician_txns[:5]:
-                    name = txn.get('name', 'Unknown')
-                    source = txn.get('source', '').upper()
-                    date = txn.get('date', 'N/A')
-                    amount = txn.get('amount', 'N/A')
-                    days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
+            candidate['analysis'] = {
+                'confidence': confidence,
+                'reasoning': reasoning,
+                'bull_case': bull_case,
+                'bear_case': bear_case,
+                'hold_period_days': 14,
+                'analysis_type': 'RULE-BASED (No LLM)'
+            }
+            logger.info(f"  ✓ {symbol}: Confidence {confidence:.2f} (rule-based)")
+            return candidate
+        
+        # Build detailed insider breakdown
+        politician_txns = [t for t in signal_data['transactions'] if t['source'] in ['senate', 'house']]
+        director_txns = [t for t in signal_data['transactions'] if 'director' in t.get('role', '').lower()]
+        officer_txns = [t for t in signal_data['transactions'] if 'officer' in t.get('role', '').lower()]
+        
+        # Build insider details section
+        insider_details = []
+        
+        if politician_txns:
+            insider_details.append("🏛️  POLITICIAN PURCHASES (HIGHEST CONFIDENCE):")
+            for txn in politician_txns[:5]:
+                name = txn.get('name', 'Unknown')
+                source = txn.get('source', '').upper()
+                date = txn.get('date', 'N/A')
+                amount = txn.get('amount', 'N/A')
+                days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
+                insider_details.append(
+                    f"  • {name} ({source}) - {days_ago} days ago ({amount})"
+                )
+        
+        if director_txns:
+            insider_details.append("\n👔 DIRECTOR PURCHASES (HIGH CONFIDENCE):")
+            for txn in director_txns[:3]:
+                name = txn.get('name', 'Unknown')
+                date = txn.get('date', 'N/A')
+                shares = txn.get('shares', 0)
+                price = txn.get('price', 0)
+                days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
+                if shares and price:
                     insider_details.append(
-                        f"  • {name} ({source}) - {days_ago} days ago ({amount})"
+                        f"  • {name} - {days_ago} days ago: {shares:,} shares @ ${price:.2f}"
                     )
-            
-            if director_txns:
-                insider_details.append("\n👔 DIRECTOR PURCHASES (HIGH CONFIDENCE):")
-                for txn in director_txns[:3]:
-                    name = txn.get('name', 'Unknown')
-                    date = txn.get('date', 'N/A')
-                    shares = txn.get('shares', 0)
-                    price = txn.get('price', 0)
-                    days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
-                    if shares and price:
-                        insider_details.append(
-                            f"  • {name} - {days_ago} days ago: {shares:,} shares @ ${price:.2f}"
-                        )
-                    else:
-                        insider_details.append(f"  • {name} - {days_ago} days ago")
-            
-            if officer_txns:
-                insider_details.append("\n💼 OFFICER PURCHASES (LOWER CONFIDENCE - Promotional Risk):")
-                for txn in officer_txns[:2]:
-                    name = txn.get('name', 'Unknown')
-                    role = txn.get('role', '')
-                    date = txn.get('date', 'N/A')
-                    days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
-                    insider_details.append(
-                        f"  • {name} ({role}) - {days_ago} days ago"
-                    )
-            
-            insider_details_text = "\n".join(insider_details) if insider_details else "No detailed transaction data"
-            
-            # System prompt for enhanced multi-source analysis
-            system_prompt = """You are an expert stock analyst specializing in insider trading analysis.
+                else:
+                    insider_details.append(f"  • {name} - {days_ago} days ago")
+        
+        if officer_txns:
+            insider_details.append("\n💼 OFFICER PURCHASES (LOWER CONFIDENCE - Promotional Risk):")
+            for txn in officer_txns[:2]:
+                name = txn.get('name', 'Unknown')
+                role = txn.get('role', '')
+                date = txn.get('date', 'N/A')
+                days_ago = (datetime.now() - datetime.strptime(date, '%Y-%m-%d')).days if date != 'N/A' else 999
+                insider_details.append(
+                    f"  • {name} ({role}) - {days_ago} days ago"
+                )
+        
+        insider_details_text = "\n".join(insider_details) if insider_details else "No detailed transaction data"
+        
+        # System prompt for enhanced multi-source analysis
+        system_prompt = """You are an expert stock analyst specializing in insider trading analysis.
 
 Analyze insider trading signals with focus on:
 1. WHO: Politicians > Directors > Officers (quality hierarchy)
@@ -1287,9 +1327,9 @@ Return JSON format:
     "bear_case": "key risks to consider",
     "hold_period_days": 7-21
 }"""
-            
-            # User prompt with multi-source context
-            user_prompt = f"""Analyze this multi-source insider trading opportunity:
+        
+        # User prompt with multi-source context
+        user_prompt = f"""Analyze this multi-source insider trading opportunity:
 
 SYMBOL: {symbol}
 COMPANY: {profile.get('companyName', 'N/A')}
@@ -1339,43 +1379,73 @@ Consider:
 3. COORDINATION (multiple independent buyers?)
 4. TRAJECTORY (where is this stock headed based on WHO is buying?)"""
 
-            # Use whichever single LLM is available
-            single_llm = self.deepseek_llm or self.gemini_llm
-            
-            try:
-                messages = [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_prompt)
-                ]
-                
-                response = single_llm.invoke(messages)
-                content = response.content
-                
-                # Parse JSON response
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                analysis = json.loads(content)
-                
-                candidate['analysis'] = analysis
-                analyzed.append(candidate)
-                
-                logger.info(f"  ✓ {symbol}: Confidence {analysis['confidence']:.2f}")
-                
-            except Exception as e:
-                logger.error(f"  ✗ {symbol}: LLM analysis failed - {e}")
-                # Add default low confidence if LLM fails
-                candidate['analysis'] = {
-                    'confidence': 0.50,
-                    'reasoning': f'LLM analysis failed. {signal_data["total_signals"]} signals detected.',
-                    'bull_case': 'Multi-source insider activity',
-                    'bear_case': 'Unknown fundamentals',
-                    'hold_period_days': 14
-                }
-                analyzed.append(candidate)
+        # Use whichever single LLM is available
+        single_llm = self.deepseek_llm or self.gemini_llm
         
+        try:
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ]
+            
+            response = single_llm.invoke(messages)
+            content = response.content
+            
+            # Parse JSON response
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            analysis = json.loads(content)
+            
+            candidate['analysis'] = analysis
+            logger.info(f"  ✓ {symbol}: Confidence {analysis['confidence']:.2f}")
+            return candidate
+            
+        except Exception as e:
+            logger.error(f"  ✗ {symbol}: LLM analysis failed - {e}")
+            # Add default low confidence if LLM fails
+            candidate['analysis'] = {
+                'confidence': 0.50,
+                'reasoning': f'LLM analysis failed. {signal_data["total_signals"]} signals detected.',
+                'bull_case': 'Multi-source insider activity',
+                'bear_case': 'Unknown fundamentals',
+                'hold_period_days': 14
+            }
+            return candidate
+    
+    def analyze_with_llm(self, candidates: List[Dict]) -> List[Dict]:
+        """
+        Use multi-agent debate or single LLM to analyze candidates with parallel processing (15 workers)
+        Falls back to rule-based scoring if no LLM available
+        """
+        if self.multi_agent_available:
+            logger.info(f"🤖 Multi-agent debate analysis for {len(candidates)} candidates (15 parallel workers)...")
+            print("\n" + "="*80)
+            print("[MULTI-AGENT DEBATE] ANALYZING CANDIDATES (15 PARALLEL WORKERS)")
+            print("="*80)
+        else:
+            logger.info(f"🤖 Analyzing {len(candidates)} candidates (15 parallel workers)...")
+        
+        analyzed = []
+        
+        # Use ThreadPoolExecutor for parallel processing with 15 workers
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            # Submit all candidates for analysis
+            future_to_candidate = {executor.submit(self._analyze_single_candidate, candidate): candidate for candidate in candidates}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_candidate):
+                try:
+                    result = future.result()
+                    analyzed.append(result)
+                except Exception as e:
+                    candidate = future_to_candidate[future]
+                    logger.error(f"  ✗ Error analyzing {candidate.get('symbol', 'UNKNOWN')}: {e}")
+                    # Continue to next candidate on error
+        
+        logger.info(f"✅ Completed analysis of {len(analyzed)} candidates using 15 parallel workers")
         return analyzed
     
     def get_institutional_holders(self, symbol: str) -> List[Dict]:
@@ -1662,15 +1732,40 @@ Consider:
     
     def rank_and_select(self, analyzed: List[Dict]) -> List[Dict]:
         """
-        Rank by confidence and select top positions
+        Rank analyzed candidates by confidence and select top positions
+        
+        BUG FIX (2025-12-09): Multi-criteria sorting to handle confidence ties
+        Previously: Single criterion (confidence only) caused random selection
+        Now: 5-level priority when confidence scores match:
+            1. Confidence (primary)
+            2. Signal Quality Score (politicians 3.0 > directors 2.0 > officers 0.5)
+            3. Politician Count (legal insider info = highest quality)
+            4. Total Signals (coordination strength)
+            5. Recency (negative days_ago for descending order)
+        
+        Returns: Top MAX_POSITIONS candidates
         """
         # Filter by minimum confidence
         qualified = [c for c in analyzed if c['analysis']['confidence'] >= MIN_CONFIDENCE_SCORE]
         
         logger.info(f"✓ {len(qualified)}/{len(analyzed)} candidates above {MIN_CONFIDENCE_SCORE:.0%} confidence")
         
-        # Sort by confidence
-        qualified.sort(key=lambda x: x['analysis']['confidence'], reverse=True)
+        # Multi-criteria sort to handle ties deterministically
+        qualified.sort(key=lambda x: (
+            x['analysis']['confidence'],
+            x['signal_data']['weighted_quality_score'],
+            x['signal_data']['politician_count'],
+            x['signal_data']['total_signals'],
+            -x['timing_analysis']['days_ago']  # Negative for descending (recent = better)
+        ), reverse=True)
+        
+        # Log selection transparency (show tie-breaking in action)
+        logger.info("📊 Selection criteria applied:")
+        logger.info("   1. Confidence (primary)")
+        logger.info("   2. Signal Quality (politicians 3.0 > directors 2.0 > officers 0.5)")
+        logger.info("   3. Politician Count")
+        logger.info("   4. Total Signals (coordination)")
+        logger.info("   5. Recency (days since transaction)")
         
         # Select top MAX_POSITIONS
         selected = qualified[:MAX_POSITIONS]
@@ -1682,10 +1777,12 @@ Consider:
     def calculate_position_sizes(self, selected: List[Dict]) -> List[Dict]:
         """
         Calculate position sizes based on equal weighting
+        Filters out 0-share positions and reallocates capital
         """
         if not selected:
             return []
         
+        # Initial calculation
         position_size = self.capital / len(selected)
         
         for candidate in selected:
@@ -1700,11 +1797,66 @@ Consider:
                 'price': price
             }
         
+        # Filter out 0-share positions (price too high)
+        executable = [c for c in selected if c['position']['shares'] > 0]
+        filtered_count = len(selected) - len(executable)
+        
+        if filtered_count > 0:
+            logger.warning(f"🔧 Removing {filtered_count} positions with 0 shares (price exceeds allocation)")
+            print(f"\n[!] POSITION SIZING ADJUSTMENT:")
+            print(f"    {filtered_count} stocks removed - price too high for allocated capital")
+            
+            # Show filtered stocks
+            for c in selected:
+                if c['position']['shares'] == 0:
+                    symbol = c['symbol']
+                    price = c['profile']['price']
+                    allocated = c['position']['target_dollars']
+                    print(f"    ✗ {symbol}: ${price:.2f}/share (needs ${price:.2f}, allocated ${allocated:.2f})")
+            
+            # Recalculate for executable positions
+            if executable:
+                new_position_size = self.capital / len(executable)
+                print(f"\n    Reallocating capital:")
+                print(f"    ${self.capital:.2f} ÷ {len(executable)} positions = ${new_position_size:.2f} per position\n")
+                
+                for candidate in executable:
+                    symbol = candidate['symbol']
+                    price = candidate['profile']['price']
+                    old_shares = candidate['position']['shares']
+                    
+                    # Recalculate with larger allocation
+                    new_shares = int(new_position_size / price)
+                    new_cost = new_shares * price
+                    
+                    candidate['position'] = {
+                        'target_dollars': new_position_size,
+                        'shares': new_shares,
+                        'actual_dollars': new_cost,
+                        'price': price
+                    }
+                    
+                    if new_shares != old_shares:
+                        print(f"    ✓ {symbol}: {old_shares} → {new_shares} shares (${new_cost:.2f})")
+                
+                logger.info(f"✓ Reallocated: {len(executable)} executable positions")
+                return executable
+            else:
+                logger.error("❌ All positions have 0 shares - increase capital or reduce MAX_POSITIONS")
+                print("\n[ERROR] No executable positions!")
+                print("    All stocks too expensive for allocated capital")
+                print(f"    Solutions:")
+                print(f"    1. Increase CAPITAL (current: ${self.capital:.2f})")
+                print(f"    2. Reduce MAX_POSITIONS (current: {MAX_POSITIONS})")
+                print(f"    3. Add MAX_PRICE filter to exclude expensive stocks\n")
+                return []
+        
         return selected
     
     def recalculate_position_sizes(self, approved_positions: List[Dict]) -> List[Dict]:
         """
         Recalculate position sizes AFTER user approval to deploy full capital
+        Also filters 0-share positions and reallocates
         
         This fixes the bug where rejecting positions wasted capital.
         Example: 4 positions @ $250 each → User approves 2 → Should be $500 each (not $250)
@@ -1728,6 +1880,7 @@ Consider:
         print(f"Allocation per Position: ${position_size:.2f}")
         print(f"{'='*80}\n")
         
+        # Initial recalculation
         for candidate in approved_positions:
             symbol = candidate['symbol']
             price = candidate['profile']['price']
@@ -1745,6 +1898,45 @@ Consider:
                 'actual_dollars': new_cost,
                 'price': price
             }
+        
+        # Filter 0-share positions (safety check)
+        executable = [c for c in approved_positions if c['position']['shares'] > 0]
+        filtered_count = num_approved - len(executable)
+        
+        if filtered_count > 0:
+            logger.warning(f"🔧 Removing {filtered_count} approved positions with 0 shares")
+            print(f"\n[!] ADDITIONAL FILTERING:")
+            print(f"    {filtered_count} approved stocks still have 0 shares after recalculation")
+            
+            for c in approved_positions:
+                if c['position']['shares'] == 0:
+                    print(f"    ✗ {c['symbol']}: ${c['profile']['price']:.2f}/share too expensive")
+            
+            # Reallocate again
+            if executable:
+                final_position_size = self.capital / len(executable)
+                print(f"\n    Final reallocation:")
+                print(f"    ${self.capital:.2f} ÷ {len(executable)} = ${final_position_size:.2f} per position\n")
+                
+                for candidate in executable:
+                    symbol = candidate['symbol']
+                    price = candidate['profile']['price']
+                    old_shares = candidate['position']['shares']
+                    
+                    final_shares = int(final_position_size / price)
+                    final_cost = final_shares * price
+                    
+                    candidate['position'] = {
+                        'target_dollars': final_position_size,
+                        'shares': final_shares,
+                        'actual_dollars': final_cost,
+                        'price': price
+                    }
+                    
+                    if final_shares != old_shares:
+                        print(f"    ✓ {symbol}: {old_shares} → {final_shares} shares (${final_cost:.2f})")
+            
+            approved_positions = executable
             
             # Log change
             logger.info(f"  {symbol}: {old_shares} → {new_shares} shares (${old_cost:.2f} → ${new_cost:.2f})")
@@ -2312,8 +2504,51 @@ Consider:
     def get_user_approvals(self, selected: List[Dict]) -> Dict[str, bool]:
         """
         Get user approval for each proposed position (CRITICAL SAFETY)
+        Auto-approves when running non-interactively (Task Scheduler) with confidence >= 0.75
         Returns: {symbol: approved} mapping
         """
+        if not selected:
+            print("⚠️  No positions to approve (no clusters found this week)")
+            return {}
+        
+        # Check if running non-interactively (Task Scheduler)
+        auto_approve_env = os.getenv('FORM4_AUTO_APPROVE', 'false').lower() == 'true'
+        is_interactive = sys.stdin.isatty() if hasattr(sys.stdin, 'isatty') else True
+        
+        if not is_interactive or auto_approve_env:
+            # AUTO-APPROVE MODE for Task Scheduler
+            print("\n" + "="*80)
+            print("🤖 FORM 4 STRATEGY - AUTO-APPROVAL MODE (Task Scheduler)")
+            print("="*80)
+            print("Running in non-interactive mode - auto-approving high confidence positions")
+            print("Confidence threshold: 75% (0.75)")
+            print("="*80 + "\n")
+            
+            approvals = {}
+            for candidate in selected:
+                symbol = candidate['symbol']
+                confidence = candidate['analysis']['confidence']
+                signal_data = candidate.get('signal_data', {})
+                
+                # Auto-approve if confidence >= 0.75
+                if confidence >= 0.75:
+                    approvals[symbol] = True
+                    print(f"✅ AUTO-APPROVED: {symbol} (confidence: {confidence:.1%})")
+                    print(f"   Signals: {signal_data.get('total_signals', 0)} | Politicians: {signal_data.get('politician_count', 0)}")
+                    logger.info(f"Auto-approved {symbol}: confidence {confidence:.1%}")
+                else:
+                    approvals[symbol] = False
+                    print(f"❌ AUTO-REJECTED: {symbol} (confidence: {confidence:.1%} < 75%)")
+                    logger.info(f"Auto-rejected {symbol}: confidence {confidence:.1%} below threshold")
+            
+            print("\n" + "="*80)
+            approved_count = sum(approvals.values())
+            print(f"AUTO-APPROVAL SUMMARY: {approved_count}/{len(selected)} positions approved")
+            print("="*80 + "\n")
+            
+            return approvals
+        
+        # INTERACTIVE MODE - Manual approval
         print("\n" + "="*80)
         print("⚠️  FORM 4 STRATEGY - MANUAL APPROVAL REQUIRED")
         print("="*80)
@@ -2325,10 +2560,6 @@ Consider:
         print("  - Type 'all' to approve ALL positions")
         print("  - Type 'none' to reject ALL positions")
         print("="*80 + "\n")
-        
-        if not selected:
-            print("⚠️  No positions to approve (no clusters found this week)")
-            return {}
         
         approvals = {}
         
@@ -2486,11 +2717,64 @@ Consider:
             print("\n⚠️  IBKR not connected - orders saved for manual execution")
             return {}
         
-        executions = {}
+        # Check buying power BEFORE placing orders
+        buying_power = self.get_buying_power()
+        total_needed = sum(
+            candidate['position']['actual_dollars'] 
+            for candidate in selected 
+            if approvals.get(candidate['symbol'], False)
+        )
         
         print("\n" + "="*80)
         print("📊 EXECUTING APPROVED ORDERS")
+        print("="*80)
+        print(f"💰 Buying Power: ${buying_power:.2f}")
+        print(f"💰 Capital Needed: ${total_needed:.2f}")
+        
+        # Check if market is open (for informational purposes)
+        try:
+            from market_hours import is_market_open
+            market_is_open = is_market_open()
+            if not market_is_open:
+                print("\n⏰ MARKET HOURS NOTICE:")
+                print("   Market is currently CLOSED (after-hours/pre-market)")
+                print("   Orders will be queued and executed at next market open (9:30 AM ET)")
+                print("   IBKR after-hours validation uses SettledCash (not ExcessLiquidity)")
+                print(f"   ExcessLiquidity (buying power): ${buying_power:.2f}")
+                print("   If order rejected: Funds may still be settling (T+2)\n")
+        except Exception as e:
+            logger.debug(f"Market hours check skipped: {e}")
+        
+        # INTELLIGENT CAPITAL SCALING
+        scale_factor = 1.0
+        if buying_power < total_needed:
+            if buying_power < total_needed * 0.40:
+                # Less than 40% of needed capital - reject all orders
+                logger.error(f"❌ INSUFFICIENT CAPITAL: ${buying_power:.2f} < ${total_needed:.2f}")
+                print(f"\n❌ INSUFFICIENT CAPITAL - REJECTING ALL ORDERS")
+                print(f"   Available: ${buying_power:.2f}")
+                print(f"   Needed: ${total_needed:.2f}")
+                print(f"   Shortfall: ${total_needed - buying_power:.2f}")
+                print(f"\n💡 Need at least 40% of capital ({total_needed * 0.40:.2f}) to proceed.")
+                print(f"   Free up capital by closing positions or deposit more funds.")
+                print("="*80 + "\n")
+                return {}  # Return empty executions
+            else:
+                # Scale down all orders proportionally
+                scale_factor = buying_power / total_needed
+                logger.warning(f"⚠️  Scaling down orders by {scale_factor:.1%} to fit capital")
+                print(f"\n⚠️  CAPITAL CONSTRAINED - SCALING DOWN ORDERS")
+                print(f"   Available: ${buying_power:.2f}")
+                print(f"   Requested: ${total_needed:.2f}")
+                print(f"   Scaling Factor: {scale_factor:.1%}")
+                print(f"   Adjusted Total: ${total_needed * scale_factor:.2f}")
+                print(f"\n💡 Each position will be reduced proportionally to fit available capital.")
+        else:
+            print(f"✅ Sufficient capital available")
+        
         print("="*80 + "\n")
+        
+        executions = {}
         
         for candidate in selected:
             symbol = candidate['symbol']
@@ -2499,13 +2783,29 @@ Consider:
             if not approvals.get(symbol, False):
                 continue
             
-            shares = candidate['position']['shares']
+            original_shares = candidate['position']['shares']
             target_price = candidate['profile']['price']
+            
+            # Apply capital scaling
+            shares = max(1, int(original_shares * scale_factor))  # At least 1 share
+            adjusted_cost = shares * target_price
+            
+            if scale_factor < 1.0:
+                logger.info(f"{symbol}: Scaled {original_shares} → {shares} shares (${adjusted_cost:.2f})")
+                print(f"   [SCALED] {original_shares} → {shares} shares (${adjusted_cost:.2f})")
             
             try:
                 # Create IBKR contract
                 contract = Stock(symbol, 'SMART', 'USD')
                 self.ib.qualifyContracts(contract)
+                
+                # REDUNDANT CHECK: ETFs filtered in analysis phase (line ~903)
+                # Kept as safety net in case profile.isEtf was incorrect
+                if self.is_complex_etf(symbol, contract):
+                    logger.warning(f"⚠️  {symbol}: Complex/Leveraged ETF - should have been filtered earlier")
+                    print(f"⚠️  {symbol}: Skipped - ETF/Complex product (should not reach execution)")
+                    print(f"   BUG: This should have been filtered during analysis phase")
+                    continue
                 
                 logger.info(f"📈 Placing order: BUY {shares} shares of {symbol}")
                 print(f"📈 {symbol}: Placing market order for {shares} shares...")
@@ -2521,7 +2821,7 @@ Consider:
                 # Wait for fill (up to 30 seconds)
                 for i in range(30):
                     self.ib.sleep(1)
-                    if trade.orderStatus.status in ['Filled', 'Cancelled']:
+                    if trade.orderStatus.status in ['Filled', 'Cancelled', 'Inactive']:
                         break
                 
                 # Check if filled
@@ -2578,8 +2878,28 @@ Consider:
                     print(f"   [FILLED] {fill_shares} shares @ ${fill_price:.2f} = ${total_cost:.2f}")
                     
                 elif trade.orderStatus.status == 'Cancelled':
-                    logger.warning(f"⚠️  {symbol}: Order cancelled")
-                    print(f"   [WARNING] Order cancelled")
+                    # Extract cancellation reason from log
+                    cancel_reason = "Unknown reason"
+                    if trade.log:
+                        for log_entry in trade.log:
+                            if log_entry.status == 'Cancelled' and log_entry.message:
+                                cancel_reason = log_entry.message
+                                break
+                    
+                    logger.warning(f"⚠️  {symbol}: Order cancelled - {cancel_reason}")
+                    print(f"   [CANCELLED] {cancel_reason}")
+                    
+                elif trade.orderStatus.status == 'Inactive':
+                    # Extract rejection reason
+                    reject_reason = "Unknown reason"
+                    if trade.log:
+                        for log_entry in trade.log:
+                            if log_entry.message and 'Error' in log_entry.message:
+                                reject_reason = log_entry.message
+                                break
+                    
+                    logger.warning(f"⚠️  {symbol}: Order rejected (Inactive) - {reject_reason}")
+                    print(f"   [REJECTED] {reject_reason}")
                     
                 else:
                     logger.warning(f"⚠️  {symbol}: Order status: {trade.orderStatus.status}")
@@ -2687,16 +3007,48 @@ Consider:
         
         try:
             # STEP 0: Evaluate existing positions for exits FIRST (frees up capital)
+            print("\n" + "="*80)
+            print("📊 STEP 0: EXIT EVALUATION (runs before entry logic)")
+            print("="*80)
             logger.info("="*80)
             logger.info("📊 STEP 0: EXIT EVALUATION (runs before entry logic)")
             logger.info("="*80)
+            
+            # DIAGNOSTIC: Check if exit manager module exists
+            exit_manager_path = os.path.join(os.path.dirname(__file__), 'form4_exit_manager.py')
+            if not os.path.exists(exit_manager_path):
+                print(f"[WARNING] Exit manager not found at: {exit_manager_path}")
+                logger.warning(f"Exit manager module missing: {exit_manager_path}")
+            else:
+                print(f"[OK] Exit manager found: {exit_manager_path}")
+            
             try:
+                print("[+] Attempting to import exit manager...")
                 from form4_exit_manager import Form4ExitManager
+                print("[+] Initializing exit manager...")
                 exit_manager = Form4ExitManager()
-                exit_results = exit_manager.evaluate_all_positions()
+                print("[+] Running exit analysis...\n")
+                exit_results = exit_manager.run(dry_run=False)  # Execute actual exits
                 logger.info(f"✅ Exit evaluation complete: {exit_results}")
+                print(f"\n✅ Exit evaluation complete")
+                if exit_results:
+                    print(f"   Results: {exit_results}")
+            except ImportError as e:
+                logger.error(f"❌ Cannot import exit manager: {e}")
+                print(f"❌ Exit manager module not found: {e}")
+                print(f"   Python path: {sys.path[:3]}...")
+                print(f"   Current directory: {os.getcwd()}")
+                logger.warning("⚠️  Continuing to entry logic without exit analysis...")
+            except EOFError as e:
+                logger.error(f"❌ Exit manager failed (no input available): {e}")
+                print(f"❌ Exit manager error: No terminal input (running in Task Scheduler?)")
+                print(f"   This is expected when running via Task Scheduler")
+                logger.warning("⚠️  Continuing to entry logic...")
             except Exception as e:
                 logger.error(f"❌ Exit manager failed: {e}", exc_info=True)
+                print(f"❌ Exit manager error: {e}")
+                print(f"   Error type: {type(e).__name__}")
+                print("⚠️  Check logs/form4_exit_manager_*.log for details")
                 logger.warning("⚠️  Continuing to entry logic despite exit failure...")
             
             # Get updated capital after liquidations
@@ -2744,6 +3096,28 @@ Consider:
             # Step 3.75: Generate COMPREHENSIVE PDF with ALL analyzed stocks (you paid for this!)
             logger.info("[GENERATING] Comprehensive analysis PDF for all analyzed stocks...")
             comprehensive_pdf = self.generate_comprehensive_analysis_pdf(analyzed, timestamp)
+            
+            # Step 3.8: Export FULL analyzed list to JSON (for transparency and testing)
+            logger.info("💾 Exporting full analyzed list to JSON...")
+            full_analysis_file = self.output_dir / f"full_analysis_{timestamp}.json"
+            try:
+                with open(full_analysis_file, 'w') as f:
+                    json.dump({
+                        'generated_at': datetime.now().isoformat(),
+                        'strategy': 'Form 4 Multi-Source Insider Signals',
+                        'capital': self.capital,
+                        'lookback_days': LOOKBACK_DAYS,
+                        'min_confidence': MIN_CONFIDENCE_SCORE,
+                        'max_positions': MAX_POSITIONS,
+                        'total_analyzed': len(analyzed),
+                        'analyzed_stocks': analyzed
+                    }, f, indent=2, default=str)
+                logger.info(f"✓ Full analysis exported: {full_analysis_file.name}")
+                print(f"\n💾 Full analysis saved: {full_analysis_file.name}")
+                print(f"   Contains all {len(analyzed)} analyzed stocks (not just selected 4)")
+                print(f"   Use this file to test selection algorithms without re-running API calls\n")
+            except Exception as e:
+                logger.warning(f"Failed to export full analysis: {e}")
             
             # Step 4: Rank and select top positions
             selected = self.rank_and_select(analyzed)
