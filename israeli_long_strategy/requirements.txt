@@ -1,0 +1,11 @@
+yfinance
+pandas
+requests
+playwright
+langchain-deepseek
+langchain-google-genai
+langchain-core
+reportlab
+python-dotenv
+python-bidi
+arabic-reshaper

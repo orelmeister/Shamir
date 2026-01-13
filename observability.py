@@ -198,6 +198,32 @@ class TradingDatabase:
         finally:
             conn.close()
     
+    def execute_query(self, query: str, params: tuple = None):
+        """
+        Execute a SQL query and return results (for SELECT) or commit (for INSERT/UPDATE/DELETE)
+        
+        Args:
+            query: SQL query string
+            params: Optional tuple of parameters for the query
+            
+        Returns:
+            List of results for SELECT queries, None for other queries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            # If it's a SELECT query, return results
+            if query.strip().upper().startswith('SELECT'):
+                return cursor.fetchall()
+            
+            # For INSERT/UPDATE/DELETE, commit and return None
+            conn.commit()
+            return None
+    
     def log_trade(self, trade_data: Dict[str, Any]) -> int:
         """Log a trade to the database"""
         with self._get_connection() as conn:

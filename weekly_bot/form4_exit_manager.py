@@ -84,7 +84,7 @@ CHECK_INTERVAL = 3600  # Check every hour (3600 seconds)
 # IBKR Connection
 IBKR_HOST = '127.0.0.1'
 IBKR_PORT = 4001
-IBKR_CLIENT_ID = 11  # Unique client ID for exit manager
+IBKR_CLIENT_ID = 15  # Unique client ID for exit manager (changed from 11 to avoid conflicts)
 
 
 class Form4ExitManager:
@@ -399,6 +399,15 @@ class Form4ExitManager:
         except Exception as e:
             logger.error(f"Failed to load approved positions: {e}")
             return {}
+
+    def _determine_position_source(self, symbol: str, approved_map: Dict[str, Dict], db_positions: Dict[str, Dict]) -> str:
+        """Classify position source for better exit messaging"""
+        if symbol in approved_map:
+            return "FORM4_APPROVED"
+        if symbol in db_positions:
+            agent = db_positions[symbol].get('agent_name') or db_positions[symbol].get('source')
+            return f"DB:{agent}" if agent else "DB:UNKNOWN"
+        return "IBKR_ONLY"
     
     def get_current_positions(self, ignore_today: bool = True) -> List[Dict]:
         """
@@ -458,6 +467,8 @@ class Form4ExitManager:
             days_held = 0
             recommended_hold_days = 14  # Default
             original_analysis = {}
+            thesis_note = ""
+            position_source = self._determine_position_source(symbol, approved_map, db_positions)
             
             # Try database first (most reliable)
             if symbol in db_positions:
@@ -507,6 +518,20 @@ class Form4ExitManager:
             if not entry_price:
                 entry_price = ibkr_position.averageCost
                 logger.info(f"[IBKR] {symbol}: Using IBKR avgCost ${entry_price:.2f} (no tracking data)")
+
+            # Add clarity when no thesis exists (mixed portfolio sources)
+            if not original_analysis:
+                if position_source.startswith("DB:"):
+                    thesis_note = (
+                        "No stored Form 4 thesis; position was tracked via database only "
+                        f"(source={position_source}). Exit manager will use P&L, risk limits, and insider checks."
+                    )
+                elif position_source == "FORM4_APPROVED":
+                    thesis_note = "Form 4 approval file found but missing analysis block; treat as no-thesis position."
+                else:
+                    thesis_note = (
+                        "Position not from Form 4 pipeline (IBKR-only import). Using risk limits + insider checks without thesis."
+                    )
             
             # Filter out today's purchases if requested
             if ignore_today and entry_date:
@@ -540,7 +565,10 @@ class Form4ExitManager:
                 'original_analysis': original_analysis,
                 'recommended_hold_days': recommended_hold_days,
                 'market_value': current_price * quantity,
-                'cost_basis': entry_price * quantity
+                'cost_basis': entry_price * quantity,
+                'position_source': position_source,
+                'thesis_available': bool(original_analysis),
+                'thesis_note': thesis_note
             })
         
         return current_positions
@@ -561,7 +589,7 @@ class Form4ExitManager:
                 'page': 0
             }
             
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=30)
             if response.status_code != 200:
                 return {'error': 'API request failed'}
             
@@ -598,13 +626,46 @@ class Form4ExitManager:
                 'apikey': FMP_API_KEY
             }
             
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=30)
             if response.status_code == 200:
                 return response.json()[:3]
         except Exception as e:
             logger.warning(f"Failed to fetch news for {symbol}: {e}")
         
         return []
+
+    def _prepare_thesis_context(self, position: Dict) -> Dict:
+        """Normalize thesis context for exit prompts to avoid N/A outputs"""
+        original_analysis = position.get('original_analysis') or {}
+        thesis_available = bool(original_analysis) and bool(original_analysis.get('reasoning'))
+        position_source = position.get('position_source', 'UNKNOWN')
+        thesis_note = position.get('thesis_note') or ""
+
+        if thesis_available:
+            confidence = original_analysis.get('confidence')
+            reasoning = original_analysis.get('reasoning', '').strip()
+            confidence_str = f"{confidence:.0%}" if confidence is not None else "N/A"
+            summary = (
+                f"Source: {position_source} | Confidence: {confidence_str}\n"
+                f"Thesis: {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}"
+            )
+        else:
+            summary = (
+                f"No stored thesis (source: {position_source}). "
+                f"{thesis_note or 'Exit manager will rely on P&L, risk limits, and insider reversal checks.'}"
+            )
+            confidence = None
+            reasoning = thesis_note or ""
+            confidence_str = "N/A"
+
+        return {
+            'thesis_available': thesis_available,
+            'confidence': confidence,
+            'confidence_str': confidence_str,
+            'reasoning': reasoning,
+            'summary': summary,
+            'position_source': position_source
+        }
     
     def multi_agent_exit_debate(self, position: Dict, insider_activity: Dict, news: List[Dict]) -> Dict:
         """
@@ -661,6 +722,8 @@ Recent Insider Activity (last 7 days):
 - {reversal_flag}
 """
         
+        thesis_context = self._prepare_thesis_context(position)
+        
         user_prompt = f"""Should we exit position in {symbol}?
 
 POSITION STATUS:
@@ -679,9 +742,8 @@ TARGETS:
 RECENT NEWS:
 {chr(10).join([f"- {n.get('title', 'N/A')}" for n in news]) if news else "- No significant news"}
 
-ORIGINAL ANALYSIS:
-Confidence: {position['original_analysis'].get('confidence', 0):.0%}
-Thesis: {position['original_analysis'].get('reasoning', 'N/A')[:200]}...
+ORIGINAL ANALYSIS / SOURCE:
+{thesis_context['summary']}
 
 Provide your EXIT decision in JSON format."""
         

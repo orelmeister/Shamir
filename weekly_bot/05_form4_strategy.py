@@ -13,11 +13,18 @@ Strategy:
 Capital: $1000 dedicated allocation
 """
 import os
+import sys
 import json
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from pathlib import Path
+
+# Fix Unicode encoding issues on Windows
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from typing import List, Dict, Optional
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -82,8 +89,8 @@ MIN_FILINGS_FOR_CLUSTER = 3  # Minimum Form 4s to be considered a cluster (OR 1+
 LOOKBACK_DAYS = 100  # Days to look back for Form 4 filings (100 days = ~3 months pattern)
 
 # Portfolio Parameters
-CAPITAL = 1000.0  # Dedicated capital for Form 4 strategy
-MAX_POSITIONS = 4  # 2-4 positions ($250-500 per position)
+CAPITAL = 1000.0  # Fallback capital (only if IBKR not connected)
+# MAX_POSITIONS is now dynamically determined by LLM allocation debate
 MIN_CONFIDENCE_SCORE = 0.65  # Lower than main strategy (Form 4 is strong signal)
 
 # IBKR Connection Parameters
@@ -94,8 +101,12 @@ IBKR_CLIENT_ID = 10  # Unique client ID for Form 4 strategy
 class Form4Strategy:
     """Form 4 Insider Trading Strategy with Manual Approval + Autonomous Learning"""
     
-    def __init__(self):
-        self.capital = CAPITAL
+    def __init__(self, capital_override: Optional[float] = None):
+        # Capital: ALWAYS uses IBKR buying power (ExcessLiquidity)
+        # capital_override only used if IBKR not connected
+        self.capital = capital_override if capital_override is not None else CAPITAL
+        # Dynamic allocation: LLM debate determines position count and weights
+        self.llm_allocation = None  # Will be populated by allocation debate
         self.output_dir = Path("weekly_bot/form4_reports")
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
@@ -132,28 +143,28 @@ class Form4Strategy:
             except Exception as e:
                 logger.warning(f"DeepSeek Reasoner initialization failed: {e}")
         
-        # Initialize Gemini 2.5 Flash (try standard first, fallback to lite)
+        # Initialize Gemini 3 Pro (try pro first, fallback to flash)
         if GOOGLE_API_KEY and GEMINI_AVAILABLE:
             try:
-                # Try gemini-2.5-flash first (best price-performance, higher quota)
+                # Try gemini-3-pro-preview first (most capable)
                 self.gemini_llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash",
+                    model="gemini-3-pro-preview",
                     temperature=0.1
                 )
-                logger.info("✓ Initialized Gemini 2.5 Flash")
-                print("[+] GEMINI AGENT: Ready (Gemini 2.5 Flash)")
+                logger.info("✓ Initialized Gemini 3 Pro Preview")
+                print("[+] GEMINI AGENT: Ready (Gemini 3 Pro Preview)")
             except Exception as e:
-                logger.warning(f"Gemini 2.5 Flash initialization failed: {e}")
-                # Fallback to gemini-2.5-flash-lite (faster, more cost-efficient)
+                logger.warning(f"Gemini 3 Pro Preview initialization failed: {e}")
+                # Fallback to gemini-2.5-pro (stable and capable)
                 try:
                     self.gemini_llm = ChatGoogleGenerativeAI(
-                        model="gemini-2.5-flash-lite",
+                        model="gemini-2.5-pro",
                         temperature=0.1
                     )
-                    logger.info("✓ Initialized Gemini 2.5 Flash-Lite (fallback)")
-                    print("[+] GEMINI AGENT: Ready (Gemini 2.5 Flash-Lite)")
+                    logger.info("✓ Initialized Gemini 2.5 Pro (fallback)")
+                    print("[+] GEMINI AGENT: Ready (Gemini 2.5 Pro)")
                 except Exception as e2:
-                    logger.warning(f"Gemini 2.5 Flash-Lite initialization also failed: {e2}")
+                    logger.warning(f"Gemini 2.5 Pro initialization also failed: {e2}")
         
         # Check if multi-agent debate available
         if self.deepseek_llm and self.gemini_llm:
@@ -186,6 +197,83 @@ class Form4Strategy:
             print("   - 10-20% better accuracy (MIT research)")
             print("   - Catches promotional/biased signals")
             print("="*80 + "\n")
+        
+        # A/B Testing Configuration for Signal Weight Optimization
+        # Based on historical performance analysis (Dec 2025)
+        self.enable_weight_testing = os.getenv("ENABLE_AB_TESTING", "true").lower() == "true"
+        self.use_new_weights = os.getenv("USE_NEW_WEIGHTS", "false").lower() == "true"
+        
+        # Current production weights (baseline)
+        self.weights_v1 = {
+            'politician': 3.0,
+            'director': 2.0,
+            'officer': 0.5,
+            'owner_10pct': 2.0,
+            'unknown': 1.0
+        }
+        
+        # Proposed optimized weights (based on empirical analysis)
+        # Directors: 2.0 → 2.5 (+25% - justified by 69.6% win rate, n=23)
+        # Officers: 0.5 → 0.2 (-60% - justified by -2.17% ROI, n=7)
+        # Politicians: 3.0 → 3.0 (unchanged - insufficient data, n=2)
+        self.weights_v2 = {
+            'politician': 3.0,  # No change (n=2 too small)
+            'director': 2.5,    # +25% increase (HIGH confidence from n=23, 69.6% win rate)
+            'officer': 0.2,     # -60% decrease (MODERATE confidence from n=7, negative ROI)
+            'owner_10pct': 2.0, # No change (no data yet)
+            'unknown': 1.0      # No change
+        }
+        
+        # Active weight set (default to v1 for safety)
+        self.active_weights = self.weights_v1 if not self.use_new_weights else self.weights_v2
+        
+        if self.enable_weight_testing:
+            logger.info("🧪 A/B Testing ENABLED - tracking both weight systems")
+            print("[🧪] A/B TESTING MODE: Logging decisions with both weight sets")
+            print(f"[⚙️] Active weights: {'V2 (NEW)' if self.use_new_weights else 'V1 (CURRENT)'}")
+            print(f"    Politicians: {self.active_weights['politician']}")
+            print(f"    Directors: {self.active_weights['director']}")
+            print(f"    Officers: {self.active_weights['officer']}\n")
+            
+            # Initialize A/B testing database table
+            self._init_ab_testing_table()
+        else:
+            logger.info("📊 Using production weights (A/B testing disabled)")
+    
+    def _init_ab_testing_table(self):
+        """Create A/B testing log table if it doesn't exist"""
+        try:
+            self.db.execute_query("""
+                CREATE TABLE IF NOT EXISTS ab_test_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    weight_v1_score REAL,
+                    weight_v2_score REAL,
+                    politician_count INTEGER,
+                    director_count INTEGER,
+                    officer_count INTEGER,
+                    total_signals INTEGER,
+                    active_version TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    pnl REAL,
+                    outcome TEXT,
+                    notes TEXT
+                )
+            """)
+            
+            # Create index for efficient queries
+            self.db.execute_query("""
+                CREATE INDEX IF NOT EXISTS idx_ab_test_symbol_timestamp 
+                ON ab_test_log(symbol, timestamp)
+            """)
+            
+            logger.info("✓ A/B testing database table initialized")
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize A/B testing table: {e}")
     
     def connect_to_ibkr(self) -> bool:
         """
@@ -223,6 +311,47 @@ class Form4Strategy:
                 logger.info("🔌 Disconnected from IBKR")
             except Exception as e:
                 logger.warning(f"Error disconnecting from IBKR: {e}")
+    
+    def log_ab_test_decision(self, symbol: str, signal_data: Dict, action: str):
+        """
+        Log A/B testing decision for later performance comparison
+        
+        Args:
+            symbol: Stock symbol
+            signal_data: Signal aggregation data with ab_testing scores
+            action: 'BUY', 'SKIP', or 'REJECT'
+        """
+        if not self.enable_weight_testing or 'ab_testing' not in signal_data:
+            return
+        
+        try:
+            ab_data = signal_data['ab_testing']
+            
+            # Log to database for tracking
+            self.db.execute_query("""
+                INSERT INTO ab_test_log (
+                    timestamp, symbol, action, 
+                    weight_v1_score, weight_v2_score, 
+                    politician_count, director_count, officer_count,
+                    total_signals, active_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(),
+                symbol,
+                action,
+                ab_data['weighted_quality_v1'],
+                ab_data['weighted_quality_v2'],
+                signal_data['politician_count'],
+                signal_data['director_count'],
+                signal_data['officer_count'],
+                signal_data['total_signals'],
+                'v2' if self.use_new_weights else 'v1'
+            ))
+            
+            logger.info(f"[A/B] Logged {action} decision for {symbol} (V1: {ab_data['weighted_quality_v1']:.2f}, V2: {ab_data['weighted_quality_v2']:.2f})")
+            
+        except Exception as e:
+            logger.warning(f"Failed to log A/B test decision: {e}")
     
     def get_buying_power(self) -> float:
         """Get available buying power from IBKR using ExcessLiquidity (bypasses T+2 settlement)"""
@@ -385,43 +514,52 @@ class Form4Strategy:
             'house': house_buys
         }
     
-    def calculate_signal_quality(self, insider_role: str, is_politician: bool = False) -> float:
+    def calculate_signal_quality(self, insider_role: str, is_politician: bool = False, weight_version: str = 'active') -> float:
         """
         Calculate signal quality weight based on insider type
         
-        Signal Hierarchy (User's Insight):
-        - Politicians (Senate/House): 3.0 = HIGHEST (legal insider info)
-        - Directors: 2.0 = HIGH (external validation)
+        Signal Hierarchy (User's Insight + Empirical Data):
+        - Politicians (Senate/House): 3.0 = HIGHEST (legal insider info, 100% win rate from n=2)
+        - Directors: 2.0 → 2.5 = HIGH (external validation, 69.6% win rate from n=23)
         - 10% Owners: 2.0 = HIGH (major stakeholder)
-        - Officers: 0.5 = LOWER (promotional risk - "trying to raise stock price artificially")
+        - Officers: 0.5 → 0.2 = LOWER (promotional risk, -2.17% ROI from n=7)
         
         Args:
             insider_role: Role from typeOfOwner or office field
             is_politician: True if from Senate/House data
+            weight_version: 'active', 'v1', or 'v2' (for A/B testing)
         
-        Returns: Quality weight (0.5-3.0)
+        Returns: Quality weight (0.2-3.0)
         """
+        # Select weight set based on version
+        if weight_version == 'v1':
+            weights = self.weights_v1
+        elif weight_version == 'v2':
+            weights = self.weights_v2
+        else:
+            weights = self.active_weights
+        
         # Politicians = HIGHEST confidence
         if is_politician:
-            return 3.0
+            return weights['politician']
         
         # Parse role
         role_lower = insider_role.lower() if insider_role else ""
         
         # Directors and board members = HIGH confidence
         if 'director' in role_lower or 'board' in role_lower:
-            return 2.0
+            return weights['director']
         
         # 10% owners = HIGH confidence
         if '10%' in role_lower or '10 percent' in role_lower or 'ten percent' in role_lower:
-            return 2.0
+            return weights['owner_10pct']
         
         # Officers = LOWER confidence (promotional risk)
         if any(word in role_lower for word in ['officer', 'ceo', 'cfo', 'coo', 'president', 'vice president', 'executive']):
-            return 0.5
+            return weights['officer']
         
         # Default for unknown roles
-        return 1.0
+        return weights['unknown']
     
     def analyze_timing(self, transaction_date_str: str, entry_price: Optional[float], current_price: Optional[float]) -> Dict:
         """
@@ -474,9 +612,58 @@ class Form4Strategy:
             'timing_status': timing_status
         }
     
+    def calculate_multi_layer_boosts(self, signal_data: Dict) -> Dict:
+        """
+        Calculate multi-layer validation boosts for politician-backed stocks
+        
+        Boosts applied to BASE confidence score:
+        - Director confirmation: +26.5% (institutional validation)
+        - Fresh signal (<14 days): +5% (timing advantage)
+        - Institutional contradiction: -15% penalty (conflicting signals)
+        
+        Args:
+            signal_data: Dict with politician_count, director_count, transaction dates, etc.
+        
+        Returns: Dict with boost_multiplier and boost_reasons
+        """
+        boosts = []
+        boost_multiplier = 1.0
+        
+        # BOOST 1: Director confirmation (+26.5%)
+        # Directors on board provides institutional validation
+        if signal_data['director_count'] > 0:
+            boost_multiplier *= 1.265
+            boosts.append(f"Directors buying (+26.5%, {signal_data['director_count']} directors...")
+        
+        # BOOST 2: Fresh signal (<14 days, +5%)
+        # Timing advantage - more relevant current signal
+        if signal_data['transactions']:
+            most_recent_date = max(
+                [datetime.strptime(t.get('date', '2000-01-01'), '%Y-%m-%d') for t in signal_data['transactions']]
+            )
+            days_ago = (datetime.now() - most_recent_date).days
+            if 0 < days_ago <= 14:
+                boost_multiplier *= 1.05
+                boosts.append(f"Recent signal 7-14 days (+5%)" if days_ago <= 14 else None)
+        
+        # BOOST 3: Institutional contradiction penalty (-15%)
+        # If institutions selling while politicians buying = conflicting signals
+        # (This would require checking market sentiment or short data)
+        # For now, we assume all signals are positive buying
+        
+        return {
+            'boost_multiplier': round(boost_multiplier, 3),
+            'boost_reasons': [b for b in boosts if b]
+        }
+    
     def aggregate_multi_source_signals(self, multi_source_data: Dict[str, List[Dict]]) -> Dict[str, Dict]:
         """
-        Aggregate signals across all 4 sources with quality weighting
+        Aggregate signals across all 4 sources with politician-first hard gate
+        
+        STRATEGY: POLITICIAN-FIRST with multi-layer validation
+        - HARD GATE: Stock MUST have >=1 politician signal or REJECT immediately
+        - All director/institution/news signals used ONLY as ranking boosters
+        - Result: 100% politician-backed portfolio
         
         Returns: Dict[symbol] = {
             'total_signals': int,
@@ -484,7 +671,9 @@ class Form4Strategy:
             'director_count': int,
             'officer_count': int,
             'owner_count': int,
-            'weighted_quality_score': float,
+            'weighted_quality_score': float (BASE confidence)
+            'boost_multiplier': float (multi-layer validation boost),
+            'final_confidence': float (boosted confidence = BASE * BOOST),
             'transactions': List[Dict],  # All transactions for this symbol
             'timing_analysis': Dict,
             'source_breakdown': Dict
@@ -521,8 +710,22 @@ class Form4Strategy:
                 else:
                     role = txn.get('typeOfOwner', '')
                 
-                # Calculate quality weight
-                quality_weight = self.calculate_signal_quality(role, is_political)
+                # Calculate quality weight (active weights for production)
+                quality_weight = self.calculate_signal_quality(role, is_political, 'active')
+                
+                # A/B Testing: Calculate with both weight sets for comparison
+                if self.enable_weight_testing:
+                    quality_weight_v1 = self.calculate_signal_quality(role, is_political, 'v1')
+                    quality_weight_v2 = self.calculate_signal_quality(role, is_political, 'v2')
+                    
+                    # Store both for later comparison
+                    if 'ab_testing' not in all_signals[symbol]:
+                        all_signals[symbol]['ab_testing'] = {
+                            'weighted_quality_v1': 0.0,
+                            'weighted_quality_v2': 0.0
+                        }
+                    all_signals[symbol]['ab_testing']['weighted_quality_v1'] += quality_weight_v1
+                    all_signals[symbol]['ab_testing']['weighted_quality_v2'] += quality_weight_v2
                 
                 # Categorize by type
                 role_lower = role.lower() if role else ""
@@ -557,29 +760,68 @@ class Form4Strategy:
                 data['weighted_quality_score'] = round(
                     data['weighted_quality_score'] / data['total_signals'], 2
                 )
+                
+                # A/B Testing: Calculate averages for both weight sets
+                if self.enable_weight_testing and 'ab_testing' in data:
+                    data['ab_testing']['weighted_quality_v1'] = round(
+                        data['ab_testing']['weighted_quality_v1'] / data['total_signals'], 2
+                    )
+                    data['ab_testing']['weighted_quality_v2'] = round(
+                        data['ab_testing']['weighted_quality_v2'] / data['total_signals'], 2
+                    )
         
-        # Filter to stocks with 3+ signals OR any politician signal
-        filtered_signals = {
-            symbol: data for symbol, data in all_signals.items()
-            if data['total_signals'] >= MIN_FILINGS_FOR_CLUSTER or data['politician_count'] > 0
-        }
+        # POLITICIAN-FIRST HARD GATE: Only accept stocks with >=1 politician signal
+        # This is the critical filter: NO director-only, institution-only, or officer-only stocks
+        filtered_signals = {}
         
-        print(f"[RESULTS] SIGNAL AGGREGATION:")
+        for symbol, data in all_signals.items():
+            if data['politician_count'] > 0:
+                # Calculate multi-layer boosts for ranking
+                boosts = self.calculate_multi_layer_boosts(data)
+                data['boost_multiplier'] = boosts['boost_multiplier']
+                data['boost_reasons'] = boosts['boost_reasons']
+                
+                # Final confidence = BASE confidence * boost multiplier
+                data['final_confidence'] = round(
+                    data['weighted_quality_score'] * boosts['boost_multiplier'], 3
+                )
+                
+                filtered_signals[symbol] = data
+        
+        print(f"[RESULTS] SIGNAL AGGREGATION (POLITICIAN-FIRST):")
         print(f"   Total stocks with activity: {len(all_signals)}")
-        print(f"   Stocks meeting criteria: {len(filtered_signals)}")
-        print(f"   Criteria: >={MIN_FILINGS_FOR_CLUSTER} signals OR >=1 politician signal\n")
+        print(f"   [HARD GATE] Politician-backed only: {len(filtered_signals)}")
+        print(f"   Criterion: >=1 politician signal (MANDATORY)\n")
         
         if filtered_signals:
-            print("[TOP STOCKS] BY SIGNAL QUALITY:\n")
+            print("[TOP STOCKS] BY FINAL CONFIDENCE (Politician-Backed with Multi-Layer Boosts):\n")
             sorted_signals = sorted(
                 filtered_signals.items(),
-                key=lambda x: (x[1]['weighted_quality_score'], x[1]['total_signals']),
+                key=lambda x: (x[1]['final_confidence'], x[1]['total_signals']),
                 reverse=True
             )[:15]
             
             for symbol, data in sorted_signals:
-                quality_stars = "*" * min(3, int(data['weighted_quality_score']))
-                print(f"   {symbol}: Score {data['weighted_quality_score']:.2f}/3.0 {quality_stars}")
+                base_score = data['weighted_quality_score']
+                final_score = data['final_confidence']
+                boost_pct = ((data['boost_multiplier'] - 1.0) * 100)
+                quality_stars = "*" * min(3, int(final_score))
+                
+                print(f"   {symbol}: Base {base_score:.2f} → Final {final_score:.2f} {quality_stars} (+{boost_pct:.1f}%)")
+                
+                # Show boost reasons
+                if data['boost_reasons']:
+                    for reason in data['boost_reasons']:
+                        print(f"      • {reason}")
+                
+                # A/B Testing: Show comparison
+                if self.enable_weight_testing and 'ab_testing' in data:
+                    v1_score = data['ab_testing']['weighted_quality_v1']
+                    v2_score = data['ab_testing']['weighted_quality_v2']
+                    delta = v2_score - v1_score
+                    delta_str = f"+{delta:.2f}" if delta > 0 else f"{delta:.2f}"
+                    print(f"      [A/B] V1: {v1_score:.2f} | V2: {v2_score:.2f} | Delta: {delta_str}")
+                
                 print(f"      Signals: {data['total_signals']} total | "
                       f"Politicians: {data['politician_count']} | "
                       f"Directors: {data['director_count']} | "
@@ -958,6 +1200,9 @@ class Form4Strategy:
                 'signal_data': signal_data,
                 'timing_analysis': timing_analysis
             })
+            
+            # A/B Testing: Log candidate that passed filters
+            self.log_ab_test_decision(symbol, signal_data, 'CANDIDATE')
             
             # Log pass
             logger.info(
@@ -1730,6 +1975,267 @@ Consider:
         
         return final_score
     
+    def llm_allocation_debate(self, analyzed: List[Dict]) -> Dict:
+        """
+        LLM debate to determine optimal capital allocation
+        
+        The LLMs jointly decide:
+        1. How many positions to take (no fixed minimum/maximum)
+        2. Weight allocation per position (conviction-based, not equal weight)
+        3. Cash reserve recommendation (if any)
+        
+        Returns: {
+            'positions': [{'symbol': str, 'weight_pct': float, 'conviction': str}],
+            'cash_reserve_pct': float,
+            'reasoning': str,
+            'deepseek_view': dict,
+            'gemini_view': dict,
+            'agreement_score': float
+        }
+        """
+        if not self.multi_agent_available:
+            logger.warning("LLM allocation debate requires both models - using default allocation")
+            return None
+        
+        print("\n" + "="*80)
+        print("🤖 LLM ALLOCATION DEBATE - DETERMINING POSITION COUNT & WEIGHTS")
+        print("="*80)
+        
+        # Build summary of all analyzed candidates
+        candidate_summaries = []
+        for i, c in enumerate(analyzed[:20], 1):  # Top 20 for debate context
+            symbol = c['symbol']
+            confidence = c['analysis']['confidence']
+            quality = c['signal_data']['weighted_quality_score']
+            politicians = c['signal_data']['politician_count']
+            directors = c['signal_data']['director_count']
+            price = c['profile']['price']
+            mkt_cap = c['profile']['mktCap'] / 1_000_000
+            
+            summary = (
+                f"{i}. {symbol}: Confidence {confidence:.0%}, Quality {quality:.1f}/3.0, "
+                f"Politicians: {politicians}, Directors: {directors}, "
+                f"Price: ${price:.2f}, MktCap: ${mkt_cap:.0f}M"
+            )
+            candidate_summaries.append(summary)
+        
+        candidates_text = "\n".join(candidate_summaries)
+        
+        allocation_prompt = f'''You are a portfolio allocation expert analyzing politician-backed insider trading signals.
+
+AVAILABLE CAPITAL: ${self.capital:.2f}
+
+ANALYZED CANDIDATES (ranked by confidence):
+{candidates_text}
+
+TASK: Decide the OPTIMAL allocation strategy. You must determine:
+
+1. HOW MANY positions to take (there is NO minimum or maximum - you decide based on opportunity quality)
+2. WEIGHT for each position (conviction-based - higher confidence = higher weight)
+3. CASH RESERVE (if signal quality is weak, keep cash in reserve for better opportunities)
+
+KEY PRINCIPLES:
+- Politicians buying is the strongest signal (3.0 quality)
+- Concentration in high-conviction picks beats diversification in mediocre ones
+- Better to take 2 great positions than 8 mediocre ones
+- If no candidates are compelling, recommend 100% cash reserve
+- Consider price vs capital (expensive stocks need more capital per position)
+
+RESPOND WITH VALID JSON ONLY (no markdown, no explanation outside JSON):
+{{
+    "positions": [
+        {{"symbol": "AAAA", "weight_pct": 35, "conviction": "HIGH"}},
+        {{"symbol": "BBBB", "weight_pct": 30, "conviction": "HIGH"}},
+        {{"symbol": "CCCC", "weight_pct": 20, "conviction": "MEDIUM"}}
+    ],
+    "cash_reserve_pct": 15,
+    "reasoning": "Brief explanation of allocation logic"
+}}
+
+Rules:
+- weight_pct + cash_reserve_pct must equal 100
+- conviction must be "HIGH", "MEDIUM", or "LOW"
+- Include 0 positions if no good opportunities exist
+- Weights should reflect relative conviction (not equal weight)'''
+
+        # Get DeepSeek's allocation
+        print("[DEBATE] Round 1 - Independent Allocation Proposals")
+        deepseek_allocation = None
+        gemini_allocation = None
+        
+        try:
+            deepseek_response = self.deepseek_llm.invoke([
+                SystemMessage(content="You are a portfolio allocation expert. Respond ONLY with valid JSON."),
+                HumanMessage(content=allocation_prompt)
+            ])
+            
+            deepseek_text = deepseek_response.content if hasattr(deepseek_response, 'content') else str(deepseek_response)
+            
+            # Extract JSON from response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', deepseek_text)
+            if json_match:
+                deepseek_allocation = json.loads(json_match.group())
+                num_pos = len(deepseek_allocation.get('positions', []))
+                cash_pct = deepseek_allocation.get('cash_reserve_pct', 0)
+                print(f"   ✓ DeepSeek: {num_pos} positions, {cash_pct}% cash reserve")
+        except Exception as e:
+            logger.warning(f"DeepSeek allocation failed: {e}")
+            print(f"   ✗ DeepSeek: Failed ({e})")
+        
+        try:
+            gemini_response = self.gemini_llm.invoke([
+                SystemMessage(content="You are a portfolio allocation expert. Respond ONLY with valid JSON."),
+                HumanMessage(content=allocation_prompt)
+            ])
+            
+            gemini_text = gemini_response.content if hasattr(gemini_response, 'content') else str(gemini_response)
+            
+            # Extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', gemini_text)
+            if json_match:
+                gemini_allocation = json.loads(json_match.group())
+                num_pos = len(gemini_allocation.get('positions', []))
+                cash_pct = gemini_allocation.get('cash_reserve_pct', 0)
+                print(f"   ✓ Gemini: {num_pos} positions, {cash_pct}% cash reserve")
+        except Exception as e:
+            logger.warning(f"Gemini allocation failed: {e}")
+            print(f"   ✗ Gemini: Failed ({e})")
+        
+        # If both failed, return None
+        if not deepseek_allocation and not gemini_allocation:
+            logger.error("Both LLMs failed allocation debate - using fallback")
+            return None
+        
+        # If only one succeeded, use it
+        if not deepseek_allocation:
+            print("[CONSENSUS] Using Gemini allocation (DeepSeek failed)")
+            return {
+                'positions': gemini_allocation.get('positions', []),
+                'cash_reserve_pct': gemini_allocation.get('cash_reserve_pct', 0),
+                'reasoning': gemini_allocation.get('reasoning', ''),
+                'deepseek_view': None,
+                'gemini_view': gemini_allocation,
+                'agreement_score': 0.5
+            }
+        
+        if not gemini_allocation:
+            print("[CONSENSUS] Using DeepSeek allocation (Gemini failed)")
+            return {
+                'positions': deepseek_allocation.get('positions', []),
+                'cash_reserve_pct': deepseek_allocation.get('cash_reserve_pct', 0),
+                'reasoning': deepseek_allocation.get('reasoning', ''),
+                'deepseek_view': deepseek_allocation,
+                'gemini_view': None,
+                'agreement_score': 0.5
+            }
+        
+        # Both succeeded - reconcile differences
+        print("\n[DEBATE] Round 2 - Reconciliation")
+        
+        # Calculate agreement on position count
+        ds_positions = set(p['symbol'] for p in deepseek_allocation.get('positions', []))
+        gm_positions = set(p['symbol'] for p in gemini_allocation.get('positions', []))
+        
+        overlap = ds_positions & gm_positions
+        union = ds_positions | gm_positions
+        position_agreement = len(overlap) / len(union) if union else 1.0
+        
+        # Calculate agreement on cash reserve
+        ds_cash = deepseek_allocation.get('cash_reserve_pct', 0)
+        gm_cash = gemini_allocation.get('cash_reserve_pct', 0)
+        cash_diff = abs(ds_cash - gm_cash)
+        cash_agreement = 1.0 - (cash_diff / 100)
+        
+        overall_agreement = (position_agreement + cash_agreement) / 2
+        
+        print(f"   Position overlap: {len(overlap)}/{len(union)} ({position_agreement:.0%})")
+        print(f"   Cash reserve diff: {cash_diff:.0f}% ({cash_agreement:.0%} agreement)")
+        print(f"   Overall agreement: {overall_agreement:.0%}")
+        
+        # Build consensus allocation
+        consensus_positions = []
+        
+        # Prioritize positions both models agree on
+        for symbol in overlap:
+            ds_pos = next((p for p in deepseek_allocation['positions'] if p['symbol'] == symbol), None)
+            gm_pos = next((p for p in gemini_allocation['positions'] if p['symbol'] == symbol), None)
+            
+            # Average the weights
+            avg_weight = (ds_pos['weight_pct'] + gm_pos['weight_pct']) / 2
+            
+            # Higher conviction if both agree
+            conviction = "HIGH" if ds_pos['conviction'] == gm_pos['conviction'] == "HIGH" else \
+                        "MEDIUM" if "HIGH" in [ds_pos['conviction'], gm_pos['conviction']] else "LOW"
+            
+            consensus_positions.append({
+                'symbol': symbol,
+                'weight_pct': avg_weight,
+                'conviction': conviction,
+                'agreed': True
+            })
+        
+        # Add positions only one model selected (with reduced weight)
+        single_model_picks = (ds_positions | gm_positions) - overlap
+        for symbol in single_model_picks:
+            ds_pos = next((p for p in deepseek_allocation['positions'] if p['symbol'] == symbol), None)
+            gm_pos = next((p for p in gemini_allocation['positions'] if p['symbol'] == symbol), None)
+            
+            pos = ds_pos or gm_pos
+            # Reduce weight by 30% for single-model picks
+            reduced_weight = pos['weight_pct'] * 0.7
+            
+            consensus_positions.append({
+                'symbol': symbol,
+                'weight_pct': reduced_weight,
+                'conviction': pos['conviction'],
+                'agreed': False,
+                'source': 'deepseek' if ds_pos else 'gemini'
+            })
+        
+        # Normalize weights to ensure they sum to (100 - cash_reserve)
+        avg_cash = (ds_cash + gm_cash) / 2
+        available_for_positions = 100 - avg_cash
+        
+        total_weight = sum(p['weight_pct'] for p in consensus_positions)
+        if total_weight > 0:
+            scale_factor = available_for_positions / total_weight
+            for p in consensus_positions:
+                p['weight_pct'] = round(p['weight_pct'] * scale_factor, 1)
+        
+        # Sort by weight (highest first)
+        consensus_positions.sort(key=lambda x: x['weight_pct'], reverse=True)
+        
+        # Build reasoning
+        reasoning = (
+            f"Consensus allocation: {len(consensus_positions)} positions ({len(overlap)} agreed by both models). "
+            f"Cash reserve: {avg_cash:.0f}%. "
+            f"DeepSeek reasoning: {deepseek_allocation.get('reasoning', 'N/A')} | "
+            f"Gemini reasoning: {gemini_allocation.get('reasoning', 'N/A')}"
+        )
+        
+        print(f"\n[CONSENSUS] Final Allocation:")
+        print(f"   Positions: {len(consensus_positions)}")
+        print(f"   Cash Reserve: {avg_cash:.0f}%")
+        for p in consensus_positions:
+            agreed_marker = "✓" if p.get('agreed') else f"({p.get('source', '?')} only)"
+            print(f"   • {p['symbol']}: {p['weight_pct']:.1f}% [{p['conviction']}] {agreed_marker}")
+        print("="*80 + "\n")
+        
+        result = {
+            'positions': consensus_positions,
+            'cash_reserve_pct': avg_cash,
+            'reasoning': reasoning,
+            'deepseek_view': deepseek_allocation,
+            'gemini_view': gemini_allocation,
+            'agreement_score': overall_agreement
+        }
+        
+        # Store for later use
+        self.llm_allocation = result
+        
+        return result
+    
     def rank_and_select(self, analyzed: List[Dict]) -> List[Dict]:
         """
         Rank analyzed candidates by confidence and select top positions
@@ -1743,7 +2249,7 @@ Consider:
             4. Total Signals (coordination strength)
             5. Recency (negative days_ago for descending order)
         
-        Returns: Top MAX_POSITIONS candidates
+        Returns: Candidates selected by LLM allocation debate (or fallback top 4)
         """
         # Filter by minimum confidence
         qualified = [c for c in analyzed if c['analysis']['confidence'] >= MIN_CONFIDENCE_SCORE]
@@ -1767,35 +2273,109 @@ Consider:
         logger.info("   4. Total Signals (coordination)")
         logger.info("   5. Recency (days since transaction)")
         
-        # Select top MAX_POSITIONS
-        selected = qualified[:MAX_POSITIONS]
+        # Run LLM allocation debate to determine position count and weights
+        allocation_result = self.llm_allocation_debate(qualified)
         
-        logger.info(f"✓ Selected top {len(selected)} positions")
+        if allocation_result and allocation_result.get('positions'):
+            # LLM debate succeeded - select positions based on LLM recommendation
+            llm_symbols = [p['symbol'] for p in allocation_result['positions']]
+            
+            # Filter qualified candidates to only those recommended by LLMs
+            selected = [c for c in qualified if c['symbol'] in llm_symbols]
+            
+            # Preserve LLM weight recommendations
+            for candidate in selected:
+                llm_pos = next((p for p in allocation_result['positions'] if p['symbol'] == candidate['symbol']), None)
+                if llm_pos:
+                    candidate['llm_weight_pct'] = llm_pos['weight_pct']
+                    candidate['llm_conviction'] = llm_pos['conviction']
+                    candidate['llm_agreed'] = llm_pos.get('agreed', False)
+            
+            # Sort by LLM weight (highest allocation first)
+            selected.sort(key=lambda x: x.get('llm_weight_pct', 0), reverse=True)
+            
+            logger.info(f"✓ LLM debate selected {len(selected)} positions (cash reserve: {allocation_result['cash_reserve_pct']:.0f}%)")
+        else:
+            # LLM debate failed - fallback to top 4 by confidence
+            logger.warning("LLM allocation debate failed - using fallback (top 4 by confidence)")
+            selected = qualified[:4]
+            
+            # Assign equal weights as fallback
+            weight_per_pos = 100 / len(selected) if selected else 0
+            for candidate in selected:
+                candidate['llm_weight_pct'] = weight_per_pos
+                candidate['llm_conviction'] = 'MEDIUM'
+                candidate['llm_agreed'] = False
+        
+        logger.info(f"✓ Selected {len(selected)} positions")
         
         return selected
     
     def calculate_position_sizes(self, selected: List[Dict]) -> List[Dict]:
         """
-        Calculate position sizes based on equal weighting
+        Calculate position sizes based on LLM-recommended weights (conviction-based)
+        Falls back to equal weighting if LLM weights not available
         Filters out 0-share positions and reallocates capital
         """
         if not selected:
             return []
         
-        # Initial calculation
-        position_size = self.capital / len(selected)
+        # Check if we have LLM allocation with cash reserve
+        cash_reserve_pct = 0
+        if self.llm_allocation and 'cash_reserve_pct' in self.llm_allocation:
+            cash_reserve_pct = self.llm_allocation['cash_reserve_pct']
         
-        for candidate in selected:
-            price = candidate['profile']['price']
-            shares = int(position_size / price)
-            actual_size = shares * price
+        # Available capital = total capital - cash reserve
+        available_capital = self.capital * (1 - cash_reserve_pct / 100)
+        
+        print(f"\n[ALLOCATION] Capital: ${self.capital:.2f}")
+        if cash_reserve_pct > 0:
+            print(f"[ALLOCATION] Cash Reserve: {cash_reserve_pct:.0f}% (${self.capital * cash_reserve_pct / 100:.2f})")
+            print(f"[ALLOCATION] Available for positions: ${available_capital:.2f}")
+        
+        # Check if LLM weights are available
+        has_llm_weights = all('llm_weight_pct' in c for c in selected)
+        
+        if has_llm_weights:
+            # Use LLM conviction-based weights
+            print(f"[ALLOCATION] Using LLM conviction-based weights\n")
             
-            candidate['position'] = {
-                'target_dollars': position_size,
-                'shares': shares,
-                'actual_dollars': actual_size,
-                'price': price
-            }
+            # Normalize weights to sum to available capital
+            total_weight = sum(c['llm_weight_pct'] for c in selected)
+            
+            for candidate in selected:
+                # Calculate position size based on LLM weight
+                weight_fraction = candidate['llm_weight_pct'] / total_weight if total_weight > 0 else 1/len(selected)
+                position_dollars = available_capital * weight_fraction
+                
+                price = candidate['profile']['price']
+                shares = int(position_dollars / price)
+                actual_size = shares * price
+                
+                candidate['position'] = {
+                    'target_dollars': position_dollars,
+                    'shares': shares,
+                    'actual_dollars': actual_size,
+                    'price': price,
+                    'weight_pct': candidate['llm_weight_pct'],
+                    'conviction': candidate.get('llm_conviction', 'MEDIUM')
+                }
+        else:
+            # Fallback: equal weighting
+            print(f"[ALLOCATION] Using equal weight distribution\n")
+            position_size = available_capital / len(selected)
+            
+            for candidate in selected:
+                price = candidate['profile']['price']
+                shares = int(position_size / price)
+                actual_size = shares * price
+                
+                candidate['position'] = {
+                    'target_dollars': position_size,
+                    'shares': shares,
+                    'actual_dollars': actual_size,
+                    'price': price
+                }
         
         # Filter out 0-share positions (price too high)
         executable = [c for c in selected if c['position']['shares'] > 0]
@@ -1842,24 +2422,22 @@ Consider:
                 logger.info(f"✓ Reallocated: {len(executable)} executable positions")
                 return executable
             else:
-                logger.error("❌ All positions have 0 shares - increase capital or reduce MAX_POSITIONS")
+                logger.error("❌ All positions have 0 shares - need higher capital for these stocks")
                 print("\n[ERROR] No executable positions!")
                 print("    All stocks too expensive for allocated capital")
                 print(f"    Solutions:")
-                print(f"    1. Increase CAPITAL (current: ${self.capital:.2f})")
-                print(f"    2. Reduce MAX_POSITIONS (current: {MAX_POSITIONS})")
-                print(f"    3. Add MAX_PRICE filter to exclude expensive stocks\n")
+                print(f"    1. Increase buying power (current: ${self.capital:.2f})")
+                print(f"    2. LLMs may select lower-priced alternatives\n")
                 return []
         
         return selected
     
     def recalculate_position_sizes(self, approved_positions: List[Dict]) -> List[Dict]:
         """
-        Recalculate position sizes AFTER user approval to deploy full capital
+        Recalculate position sizes AFTER user approval using LLM conviction weights
         Also filters 0-share positions and reallocates
         
-        This fixes the bug where rejecting positions wasted capital.
-        Example: 4 positions @ $250 each → User approves 2 → Should be $500 each (not $250)
+        Uses conviction-based weighting: higher LLM weight = more capital
         
         Args:
             approved_positions: List of approved candidate dicts
@@ -1870,34 +2448,78 @@ Consider:
             return []
         
         num_approved = len(approved_positions)
-        position_size = self.capital / num_approved
+        
+        # Check cash reserve from LLM allocation
+        cash_reserve_pct = 0
+        if self.llm_allocation and 'cash_reserve_pct' in self.llm_allocation:
+            cash_reserve_pct = self.llm_allocation['cash_reserve_pct']
+        
+        available_capital = self.capital * (1 - cash_reserve_pct / 100)
         
         print(f"\n{'='*80}")
-        print(f"💰 RECALCULATING POSITION SIZES")
+        print(f"💰 RECALCULATING POSITION SIZES (LLM Conviction-Based)")
         print(f"{'='*80}")
-        print(f"Capital: ${self.capital:.2f}")
+        print(f"Total Capital: ${self.capital:.2f}")
+        if cash_reserve_pct > 0:
+            print(f"Cash Reserve: {cash_reserve_pct:.0f}% (${self.capital * cash_reserve_pct / 100:.2f})")
+        print(f"Available for Positions: ${available_capital:.2f}")
         print(f"Approved Positions: {num_approved}")
-        print(f"Allocation per Position: ${position_size:.2f}")
-        print(f"{'='*80}\n")
         
-        # Initial recalculation
-        for candidate in approved_positions:
-            symbol = candidate['symbol']
-            price = candidate['profile']['price']
-            old_shares = candidate['position']['shares']
-            old_cost = candidate['position']['actual_dollars']
+        # Check if we have LLM weights
+        has_llm_weights = all('llm_weight_pct' in c for c in approved_positions)
+        
+        if has_llm_weights:
+            # Recalculate based on relative LLM weights of APPROVED positions only
+            total_weight = sum(c['llm_weight_pct'] for c in approved_positions)
+            print(f"Allocation Method: LLM Conviction-Based")
+            print(f"{'='*80}\n")
             
-            # Recalculate shares
-            new_shares = int(position_size / price)
-            new_cost = new_shares * price
+            for candidate in approved_positions:
+                symbol = candidate['symbol']
+                price = candidate['profile']['price']
+                old_shares = candidate['position']['shares']
+                
+                # Calculate new allocation based on relative weight
+                weight_fraction = candidate['llm_weight_pct'] / total_weight if total_weight > 0 else 1/num_approved
+                position_dollars = available_capital * weight_fraction
+                
+                new_shares = int(position_dollars / price)
+                new_cost = new_shares * price
+                
+                conviction = candidate.get('llm_conviction', 'MEDIUM')
+                
+                candidate['position'] = {
+                    'target_dollars': position_dollars,
+                    'shares': new_shares,
+                    'actual_dollars': new_cost,
+                    'price': price,
+                    'weight_pct': candidate['llm_weight_pct'],
+                    'conviction': conviction
+                }
+                
+                print(f"  {symbol}: [{conviction}] {weight_fraction*100:.1f}% = ${position_dollars:.2f} → {new_shares} shares")
+        else:
+            # Fallback to equal weighting
+            position_size = available_capital / num_approved
+            print(f"Allocation Method: Equal Weight (no LLM weights)")
+            print(f"Per Position: ${position_size:.2f}")
+            print(f"{'='*80}\n")
             
-            # Update position dict
-            candidate['position'] = {
-                'target_dollars': position_size,
-                'shares': new_shares,
-                'actual_dollars': new_cost,
-                'price': price
-            }
+            for candidate in approved_positions:
+                symbol = candidate['symbol']
+                price = candidate['profile']['price']
+                old_shares = candidate['position']['shares']
+                old_cost = candidate['position']['actual_dollars']
+                
+                new_shares = int(position_size / price)
+                new_cost = new_shares * price
+                
+                candidate['position'] = {
+                    'target_dollars': position_size,
+                    'shares': new_shares,
+                    'actual_dollars': new_cost,
+                    'price': price
+                }
         
         # Filter 0-share positions (safety check)
         executable = [c for c in approved_positions if c['position']['shares'] > 0]
@@ -2860,6 +3482,20 @@ Consider:
                         }
                     })
                     
+                    # A/B Testing: Log BUY execution with entry price
+                    self.log_ab_test_decision(symbol, signal_data, 'BUY')
+                    if self.enable_weight_testing and 'ab_testing' in signal_data:
+                        try:
+                            # Update A/B log with entry price for future P&L tracking
+                            self.db.execute_query("""
+                                UPDATE ab_test_log 
+                                SET entry_price = ?, notes = ?
+                                WHERE symbol = ? AND action = 'BUY' 
+                                AND timestamp = (SELECT MAX(timestamp) FROM ab_test_log WHERE symbol = ? AND action = 'BUY')
+                            """, (fill_price, f"Filled {fill_shares} shares", symbol, symbol))
+                        except Exception as e:
+                            logger.warning(f"Failed to update A/B log with entry price: {e}")
+                    
                     # AUTONOMOUS: Track position
                     self.db.add_active_position(
                         symbol=symbol,
@@ -2989,6 +3625,315 @@ Consider:
         
         print("\n" + "=" * 80)
     
+    def load_held_positions(self) -> List[Dict]:
+        """
+        Load currently held positions from IBKR portfolio
+        
+        Returns: List of positions with symbol, quantity, avgCost, marketValue
+        """
+        if not self.ibkr_connected or not self.ib:
+            logger.warning("Cannot load positions - IBKR not connected")
+            return []
+        
+        try:
+            portfolio = self.ib.portfolio()
+            held_positions = []
+            
+            for item in portfolio:
+                # Only track stocks (not options, futures, etc.)
+                if hasattr(item.contract, 'secType') and item.contract.secType == 'STK':
+                    held_positions.append({
+                        'symbol': item.contract.symbol,
+                        'quantity': item.position,
+                        'avg_cost': item.averageCost,
+                        'market_value': item.marketValue,
+                        'unrealized_pnl': item.unrealizedPNL,
+                        'contract': item.contract
+                    })
+            
+            logger.info(f"📊 Loaded {len(held_positions)} held positions from IBKR")
+            return held_positions
+            
+        except Exception as e:
+            logger.error(f"Error loading held positions: {e}")
+            return []
+    
+    def revalidate_held_positions(self, multi_source_data: Dict[str, List[Dict]], 
+                                   held_positions: List[Dict]) -> Dict:
+        """
+        Revalidate held positions against latest politician signals
+        
+        POLITICIAN-FIRST EXIT LOGIC:
+        - If position STILL has politician signals → HOLD
+        - If position has ZERO politician signals → FLAG FOR EXIT
+        
+        Args:
+            multi_source_data: Latest insider data from fetch_multi_source_signals()
+            held_positions: Current positions from load_held_positions()
+        
+        Returns: Dict with 'hold' and 'exit' lists
+        """
+        print("\n" + "="*80)
+        print("[REVALIDATION] POLITICIAN-FIRST EXIT ANALYSIS")
+        print("="*80 + "\n")
+        
+        if not held_positions:
+            print("[INFO] No held positions to revalidate")
+            return {'hold': [], 'exit': []}
+        
+        # Aggregate signals for ALL symbols (not just politician-backed)
+        # This allows us to check if previously held positions lost their signals
+        all_signals = defaultdict(lambda: {
+            'total_signals': 0,
+            'politician_count': 0,
+            'director_count': 0,
+            'officer_count': 0,
+            'transactions': [],
+            'source_breakdown': {'insider': 0, 'latest': 0, 'senate': 0, 'house': 0}
+        })
+        
+        # Process all sources
+        for source_name, transactions in multi_source_data.items():
+            is_political = source_name in ['senate', 'house']
+            
+            for txn in transactions:
+                symbol = txn.get('symbol')
+                if not symbol or symbol == 'None':
+                    continue
+                
+                role = txn.get('office', '') if is_political else txn.get('typeOfOwner', '')
+                role_lower = role.lower() if role else ""
+                
+                # Count signal types
+                if is_political:
+                    all_signals[symbol]['politician_count'] += 1
+                elif 'director' in role_lower:
+                    all_signals[symbol]['director_count'] += 1
+                elif any(w in role_lower for w in ['officer', 'ceo', 'cfo', 'president']):
+                    all_signals[symbol]['officer_count'] += 1
+                
+                all_signals[symbol]['total_signals'] += 1
+                all_signals[symbol]['source_breakdown'][source_name] += 1
+                all_signals[symbol]['transactions'].append(txn)
+        
+        # Revalidate each held position
+        positions_to_hold = []
+        positions_to_exit = []
+        
+        print(f"[ANALYZING] {len(held_positions)} held positions:\n")
+        
+        for pos in held_positions:
+            symbol = pos['symbol']
+            signals = all_signals.get(symbol, {
+                'politician_count': 0,
+                'director_count': 0,
+                'officer_count': 0,
+                'total_signals': 0
+            })
+            
+            politician_count = signals.get('politician_count', 0)
+            total_signals = signals.get('total_signals', 0)
+            
+            # POLITICIAN-FIRST DECISION
+            if politician_count > 0:
+                # HOLD: Position still has politician backing
+                positions_to_hold.append({
+                    **pos,
+                    'revalidation': {
+                        'decision': 'HOLD',
+                        'reason': f'Still backed by {politician_count} politician signal(s)',
+                        'politician_count': politician_count,
+                        'director_count': signals.get('director_count', 0),
+                        'total_signals': total_signals
+                    }
+                })
+                print(f"   ✅ {symbol}: HOLD - {politician_count} politician(s) still active")
+                print(f"      Signals: {total_signals} total | Unrealized P&L: ${pos['unrealized_pnl']:.2f}")
+                
+            else:
+                # EXIT: Position lost ALL politician signals
+                positions_to_exit.append({
+                    **pos,
+                    'revalidation': {
+                        'decision': 'EXIT',
+                        'reason': 'Lost ALL politician signals (hard-gate violation)',
+                        'politician_count': 0,
+                        'director_count': signals.get('director_count', 0),
+                        'officer_count': signals.get('officer_count', 0),
+                        'total_signals': total_signals
+                    }
+                })
+                print(f"   ❌ {symbol}: EXIT - No politician signals (had {signals.get('director_count', 0)} directors, {signals.get('officer_count', 0)} officers)")
+                print(f"      Unrealized P&L: ${pos['unrealized_pnl']:.2f} | Reason: Strategy violation")
+        
+        print(f"\n[RESULTS] Revalidation complete:")
+        print(f"   HOLD: {len(positions_to_hold)} positions")
+        print(f"   EXIT: {len(positions_to_exit)} positions")
+        print("="*80 + "\n")
+        
+        return {
+            'hold': positions_to_hold,
+            'exit': positions_to_exit
+        }
+    
+    def execute_exits(self, positions_to_exit: List[Dict]):
+        """
+        Execute exit orders for positions that lost politician backing
+        
+        Args:
+            positions_to_exit: List of positions flagged for exit from revalidation
+        
+        Returns:
+            Dict with execution results
+        """
+        if not positions_to_exit:
+            print("[INFO] No exits required\n")
+            return {'executed': 0, 'failed': 0, 'total_pnl': 0}
+        
+        print("\n" + "="*80)
+        print("[EXECUTING] POLITICIAN-FIRST EXITS")
+        print("="*80 + "\n")
+        
+        # Track results
+        executed = 0
+        failed = 0
+        total_realized_pnl = 0.0
+        
+        for pos in positions_to_exit:
+            symbol = pos['symbol']
+            quantity = abs(pos['quantity'])  # Ensure positive for selling
+            reason = pos['revalidation']['reason']
+            
+            print(f"[EXIT] {symbol}:")
+            print(f"   Quantity: {quantity} shares")
+            print(f"   Reason: {reason}")
+            print(f"   Unrealized P&L: ${pos['unrealized_pnl']:.2f}")
+            
+            if not self.ibkr_connected:
+                print(f"   ⚠️  IBKR not connected - manual exit required\n")
+                logger.warning(f"Manual exit required for {symbol} ({quantity} shares)")
+                continue
+            
+            try:
+                # Create a fresh contract with exchange='SMART' to avoid "Missing order exchange" error
+                # IBKR portfolio contracts have primaryExchange but NOT exchange field
+                contract = Stock(symbol, 'SMART', 'USD')
+                
+                # Qualify the contract to ensure it's valid
+                self.ib.qualifyContracts(contract)
+                
+                order = MarketOrder('SELL', quantity)
+                order.tif = 'DAY'
+                order.outsideRth = False
+                
+                # Place order
+                trade = self.ib.placeOrder(contract, order)
+                logger.info(f"📤 Exit order placed: {symbol} ({quantity} shares)")
+                print(f"   📤 Exit order placed, waiting for fill...")
+                
+                # Wait for fill (up to 30 seconds) - same as buy orders
+                for i in range(30):
+                    self.ib.sleep(1)
+                    if trade.orderStatus.status in ['Filled', 'Cancelled', 'Inactive']:
+                        break
+                    if i > 0 and i % 10 == 0:
+                        print(f"   ⏳ Still waiting... ({i}s)")
+                
+                # Check status
+                if trade.orderStatus.status == 'Filled':
+                    fill_price = trade.orderStatus.avgFillPrice
+                    fill_shares = trade.orderStatus.filled
+                    
+                    # Calculate realized P&L
+                    entry_price = pos.get('avg_cost', 0)
+                    realized_pnl = (fill_price - entry_price) * fill_shares if entry_price > 0 else 0
+                    pnl_pct = ((fill_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                    
+                    print(f"   ✅ FILLED {fill_shares} shares @ ${fill_price:.2f}")
+                    print(f"   💰 Realized P&L: ${realized_pnl:.2f} ({pnl_pct:+.1f}%)")
+                    logger.info(f"✅ Exit filled: {symbol} @ ${fill_price:.2f} | P&L: ${realized_pnl:.2f} ({pnl_pct:+.1f}%)")
+                    
+                    # Track success
+                    executed += 1
+                    total_realized_pnl += realized_pnl
+                    
+                    # Log to database
+                    self.db.log_trade({
+                        'agent': self.agent_name,
+                        'symbol': symbol,
+                        'action': 'SELL',
+                        'quantity': fill_shares,
+                        'price': fill_price,
+                        'reason': reason,
+                        'metadata': {
+                            **pos['revalidation'],
+                            'entry_price': entry_price,
+                            'realized_pnl': realized_pnl,
+                            'pnl_pct': pnl_pct
+                        }
+                    })
+                    
+                    # Remove from active positions
+                    try:
+                        self.db.remove_active_position(symbol)
+                        logger.info(f"Removed {symbol} from active positions")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove {symbol} from active positions: {e}")
+                        
+                elif trade.orderStatus.status == 'Cancelled':
+                    failed += 1
+                    # Extract cancellation reason from log
+                    cancel_reason = "Unknown reason"
+                    if trade.log:
+                        for log_entry in trade.log:
+                            if log_entry.status == 'Cancelled' and log_entry.message:
+                                cancel_reason = log_entry.message
+                                break
+                    
+                    logger.warning(f"⚠️  {symbol}: Exit order cancelled - {cancel_reason}")
+                    print(f"   ❌ CANCELLED: {cancel_reason}")
+                    
+                elif trade.orderStatus.status == 'Inactive':
+                    failed += 1
+                    # Extract rejection reason
+                    reject_reason = "Unknown reason"
+                    if trade.log:
+                        for log_entry in trade.log:
+                            if log_entry.message and ('Error' in log_entry.message or log_entry.errorCode != 0):
+                                reject_reason = log_entry.message
+                                break
+                    
+                    logger.warning(f"⚠️  {symbol}: Exit order rejected - {reject_reason}")
+                    print(f"   ❌ REJECTED: {reject_reason}")
+                    
+                else:
+                    failed += 1
+                    print(f"   ⏳ Order status after 30s: {trade.orderStatus.status}")
+                    logger.warning(f"Exit order incomplete: {symbol} - {trade.orderStatus.status}")
+                
+            except Exception as e:
+                failed += 1
+                logger.error(f"Error executing exit for {symbol}: {e}")
+                print(f"   ❌ Error: {e}\n")
+                continue
+            
+            print()  # Blank line between positions
+        
+        # Print exit summary
+        print("="*80)
+        print("[EXIT SUMMARY]")
+        print(f"   Total Exit Attempts: {len(positions_to_exit)}")
+        print(f"   Successfully Filled: {executed}")
+        print(f"   Failed/Pending: {failed}")
+        print(f"   Total Realized P&L: ${total_realized_pnl:+.2f}")
+        print("="*80 + "\n")
+        
+        return {
+            'executed': executed,
+            'failed': failed,
+            'total_pnl': total_realized_pnl
+        }
+    
     def run(self):
         """
         Main execution flow with automatic order execution
@@ -2997,61 +3942,63 @@ Consider:
         logger.info("="*80)
         logger.info("🚀 FORM 4 INSIDER CLUSTER STRATEGY - STARTING")
         logger.info("="*80)
-        logger.info(f"Capital: ${self.capital:.2f} | Max Positions: {MAX_POSITIONS}")
+        logger.info(f"Capital (pre-connect): ${self.capital:.2f} | Positions: LLM-determined")
         
         # Generate timestamp for this run
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Connect to IBKR for automatic order execution
         self.connect_to_ibkr()
+
+        # ALWAYS use buying power (ExcessLiquidity) when IBKR connected
+        if self.ibkr_connected:
+            buying_power = self.get_buying_power()
+            if buying_power > 0:
+                self.capital = buying_power
+                logger.info(f"💰 Using IBKR Buying Power: ${self.capital:.2f}")
+                print(f"\n[CAPITAL] Using full buying power: ${self.capital:.2f}")
+                print(f"[ALLOCATION] Position count and weights will be determined by LLM debate\n")
+            else:
+                logger.warning("Buying power unavailable; falling back to configured capital")
+                print("\n[WARN] Buying power unavailable. Falling back to configured capital.\n")
+        else:
+            logger.info(f"💰 Capital in use: ${self.capital:.2f} (IBKR not connected)")
         
         try:
-            # STEP 0: Evaluate existing positions for exits FIRST (frees up capital)
+            # STEP 0: Fetch multi-source signals (reuse for both exits and entries)
+            logger.info("="*80)
+            logger.info("📊 STEP 0: FETCH MULTI-SOURCE SIGNALS (for exits + entries)")
+            logger.info("="*80)
+            multi_source_data = self.fetch_multi_source_signals()
+            
+            # STEP 1: Exit revalidation FIRST (politician-first strategy)
             print("\n" + "="*80)
-            print("📊 STEP 0: EXIT EVALUATION (runs before entry logic)")
+            print("📊 STEP 1: EXIT REVALIDATION (politician-first)")
             print("="*80)
             logger.info("="*80)
-            logger.info("📊 STEP 0: EXIT EVALUATION (runs before entry logic)")
+            logger.info("📊 STEP 1: EXIT REVALIDATION (politician-first)")
             logger.info("="*80)
             
-            # DIAGNOSTIC: Check if exit manager module exists
-            exit_manager_path = os.path.join(os.path.dirname(__file__), 'form4_exit_manager.py')
-            if not os.path.exists(exit_manager_path):
-                print(f"[WARNING] Exit manager not found at: {exit_manager_path}")
-                logger.warning(f"Exit manager module missing: {exit_manager_path}")
+            # Load held positions from IBKR
+            held_positions = self.load_held_positions()
+            
+            # Revalidate against latest politician signals
+            revalidation_results = self.revalidate_held_positions(multi_source_data, held_positions)
+            
+            # Execute exits for positions that lost politician backing
+            positions_to_exit = revalidation_results['exit']
+            exit_results = {'executed': 0, 'failed': 0, 'total_pnl': 0}
+            if positions_to_exit:
+                exit_results = self.execute_exits(positions_to_exit)
+                
+                # Wait for IBKR to update capital after exits
+                if exit_results['executed'] > 0:
+                    print("[WAITING] Allowing 5 seconds for capital settlement...")
+                    self.ib.sleep(5)
             else:
-                print(f"[OK] Exit manager found: {exit_manager_path}")
+                print("[INFO] All held positions passed revalidation (still politician-backed)\n")
             
-            try:
-                print("[+] Attempting to import exit manager...")
-                from form4_exit_manager import Form4ExitManager
-                print("[+] Initializing exit manager...")
-                exit_manager = Form4ExitManager()
-                print("[+] Running exit analysis...\n")
-                exit_results = exit_manager.run(dry_run=False)  # Execute actual exits
-                logger.info(f"✅ Exit evaluation complete: {exit_results}")
-                print(f"\n✅ Exit evaluation complete")
-                if exit_results:
-                    print(f"   Results: {exit_results}")
-            except ImportError as e:
-                logger.error(f"❌ Cannot import exit manager: {e}")
-                print(f"❌ Exit manager module not found: {e}")
-                print(f"   Python path: {sys.path[:3]}...")
-                print(f"   Current directory: {os.getcwd()}")
-                logger.warning("⚠️  Continuing to entry logic without exit analysis...")
-            except EOFError as e:
-                logger.error(f"❌ Exit manager failed (no input available): {e}")
-                print(f"❌ Exit manager error: No terminal input (running in Task Scheduler?)")
-                print(f"   This is expected when running via Task Scheduler")
-                logger.warning("⚠️  Continuing to entry logic...")
-            except Exception as e:
-                logger.error(f"❌ Exit manager failed: {e}", exc_info=True)
-                print(f"❌ Exit manager error: {e}")
-                print(f"   Error type: {type(e).__name__}")
-                print("⚠️  Check logs/form4_exit_manager_*.log for details")
-                logger.warning("⚠️  Continuing to entry logic despite exit failure...")
-            
-            # Get updated capital after liquidations
+            # Get updated capital after exits
             if self.ib and self.ib.isConnected():
                 account_summary = self.ib.accountSummary()
                 for item in account_summary:
@@ -3059,13 +4006,18 @@ Consider:
                         available_cash = float(item.value)
                         logger.info(f"💰 Available cash after exits: ${available_cash:.2f}")
                         break
+
+                # ALWAYS refresh buying power after exits
+                if self.ibkr_connected:
+                    updated_bp = self.get_buying_power()
+                    if updated_bp > 0:
+                        self.capital = updated_bp
+                        logger.info(f"💰 Capital updated after exits: Buying Power = ${self.capital:.2f}")
+                        print(f"[CAPITAL] Updated buying power after exits: ${self.capital:.2f}")
             
             logger.info("="*80)
-            logger.info("📈 STEP 1: ENTRY LOGIC (searching for new opportunities)")
+            logger.info("📈 STEP 2: ENTRY LOGIC (searching for new opportunities)")
             logger.info("="*80)
-            
-            # Step 1: Fetch multi-source insider signals
-            multi_source_data = self.fetch_multi_source_signals()
             
             # Step 2: Aggregate signals with quality weighting
             aggregated_signals = self.aggregate_multi_source_signals(multi_source_data)
@@ -3108,13 +4060,13 @@ Consider:
                         'capital': self.capital,
                         'lookback_days': LOOKBACK_DAYS,
                         'min_confidence': MIN_CONFIDENCE_SCORE,
-                        'max_positions': MAX_POSITIONS,
+                        'position_selection': 'LLM_ALLOCATION_DEBATE',
                         'total_analyzed': len(analyzed),
                         'analyzed_stocks': analyzed
                     }, f, indent=2, default=str)
                 logger.info(f"✓ Full analysis exported: {full_analysis_file.name}")
                 print(f"\n💾 Full analysis saved: {full_analysis_file.name}")
-                print(f"   Contains all {len(analyzed)} analyzed stocks (not just selected 4)")
+                print(f"   Contains all {len(analyzed)} analyzed stocks")
                 print(f"   Use this file to test selection algorithms without re-running API calls\n")
             except Exception as e:
                 logger.warning(f"Failed to export full analysis: {e}")
@@ -3194,7 +4146,19 @@ Consider:
 
 def main():
     """Entry point"""
-    strategy = Form4Strategy()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run Form 4 insider strategy")
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=None,
+        help="Fallback capital if IBKR not connected (default $1000). IBKR buying power is ALWAYS used when connected."
+    )
+
+    args = parser.parse_args()
+
+    strategy = Form4Strategy(capital_override=args.capital)
     strategy.run()
 
 
