@@ -102,7 +102,7 @@ class Form4Strategy:
     """Form 4 Insider Trading Strategy with Manual Approval + Autonomous Learning"""
     
     def __init__(self, capital_override: Optional[float] = None):
-        # Capital: ALWAYS uses IBKR buying power (ExcessLiquidity)
+        # Capital: ALWAYS uses IBKR settled cash (T+2 compliant - prevents order rejections)
         # capital_override only used if IBKR not connected
         self.capital = capital_override if capital_override is not None else CAPITAL
         # Dynamic allocation: LLM debate determines position count and weights
@@ -275,6 +275,40 @@ class Form4Strategy:
         except Exception as e:
             logger.warning(f"Failed to initialize A/B testing table: {e}")
     
+    def _extract_llm_text(self, response) -> str:
+        """
+        Extract text content from LLM response.
+        Handles Gemini 3 Pro which returns .content as a list instead of string.
+        
+        Args:
+            response: LLM response object
+        
+        Returns: String content
+        """
+        if not hasattr(response, 'content'):
+            return str(response)
+        
+        content = response.content
+        
+        # If content is a string, return directly
+        if isinstance(content, str):
+            return content
+        
+        # If content is a list (Gemini 3 Pro format), extract text from parts
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif hasattr(part, 'text'):
+                    text_parts.append(part.text)
+                elif isinstance(part, dict) and 'text' in part:
+                    text_parts.append(part['text'])
+            return '\n'.join(text_parts)
+        
+        # Fallback to string conversion
+        return str(content)
+    
     def connect_to_ibkr(self) -> bool:
         """
         Connect to Interactive Brokers for automatic order execution
@@ -353,24 +387,47 @@ class Form4Strategy:
         except Exception as e:
             logger.warning(f"Failed to log A/B test decision: {e}")
     
-    def get_buying_power(self) -> float:
-        """Get available buying power from IBKR using ExcessLiquidity (bypasses T+2 settlement)"""
+    def get_settled_cash(self) -> float:
+        """Get available settled cash from IBKR (T+2 compliant - what IBKR actually allows for orders)"""
         if not self.ibkr_connected:
             return 0.0
         
         try:
             account_values = self.ib.accountValues()
             for av in account_values:
-                if av.tag == 'ExcessLiquidity' and av.currency == 'USD':
-                    buying_power = float(av.value)
-                    logger.info(f"💰 IBKR Buying Power (ExcessLiquidity): ${buying_power:.2f}")
-                    return buying_power
+                if av.tag == 'SettledCash' and av.currency == 'USD':
+                    settled_cash = float(av.value)
+                    logger.info(f"💰 IBKR Settled Cash: ${settled_cash:.2f}")
+                    return settled_cash
             
-            logger.warning("ExcessLiquidity not found in account values")
+            logger.warning("SettledCash not found in account values")
             return 0.0
         except Exception as e:
-            logger.error(f"Error fetching buying power: {e}")
+            logger.error(f"Error fetching settled cash: {e}")
             return 0.0
+    
+    def validate_ibkr_contract(self, symbol: str) -> bool:
+        """
+        Validate that a ticker can be traded on IBKR.
+        Purely data-driven - no manual mappings or bias.
+        
+        Returns: True if contract is valid and tradeable
+        """
+        if not self.ibkr_connected:
+            # If not connected to IBKR, can't validate - assume valid
+            return True
+        
+        try:
+            contract = Stock(symbol, 'SMART', 'USD')
+            qualified = self.ib.qualifyContracts(contract)
+            if qualified and contract.conId:
+                return True
+            else:
+                logger.warning(f"⚠️  {symbol}: Cannot qualify on IBKR - ticker may be delisted or changed")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠️  {symbol}: Contract validation error: {e}")
+            return False
     
     def is_complex_etf(self, symbol: str, contract) -> bool:
         """Check if stock is a complex/leveraged ETF requiring special permissions"""
@@ -1305,7 +1362,7 @@ Provide your analysis in JSON format."""
         try:
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             deepseek_raw = self.deepseek_llm.invoke(messages)
-            deepseek_text = deepseek_raw.content if hasattr(deepseek_raw, 'content') else str(deepseek_raw)
+            deepseek_text = self._extract_llm_text(deepseek_raw)
             
             # Parse JSON
             import json, re
@@ -1320,7 +1377,7 @@ Provide your analysis in JSON format."""
         try:
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             gemini_raw = self.gemini_llm.invoke(messages)
-            gemini_text = gemini_raw.content if hasattr(gemini_raw, 'content') else str(gemini_raw)
+            gemini_text = self._extract_llm_text(gemini_raw)
             
             # Parse JSON
             json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', gemini_text, re.DOTALL)
@@ -1386,7 +1443,7 @@ Do you maintain your confidence or adjust based on this perspective? Return upda
             
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=critique_prompt)]
             deepseek_rebuttal_raw = self.deepseek_llm.invoke(messages)
-            deepseek_rebuttal_text = deepseek_rebuttal_raw.content if hasattr(deepseek_rebuttal_raw, 'content') else str(deepseek_rebuttal_raw)
+            deepseek_rebuttal_text = self._extract_llm_text(deepseek_rebuttal_raw)
             
             json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', deepseek_rebuttal_text, re.DOTALL)
             if json_match:
@@ -1408,7 +1465,7 @@ Do you maintain your confidence or adjust based on this perspective? Return upda
             
             messages = [SystemMessage(content=system_prompt), HumanMessage(content=critique_prompt)]
             gemini_rebuttal_raw = self.gemini_llm.invoke(messages)
-            gemini_rebuttal_text = gemini_rebuttal_raw.content if hasattr(gemini_rebuttal_raw, 'content') else str(gemini_rebuttal_raw)
+            gemini_rebuttal_text = self._extract_llm_text(gemini_rebuttal_raw)
             
             json_match = re.search(r'\{[^{}]*"confidence"[^{}]*\}', gemini_rebuttal_text, re.DOTALL)
             if json_match:
@@ -2069,7 +2126,7 @@ Rules:
                 HumanMessage(content=allocation_prompt)
             ])
             
-            deepseek_text = deepseek_response.content if hasattr(deepseek_response, 'content') else str(deepseek_response)
+            deepseek_text = self._extract_llm_text(deepseek_response)
             
             # Extract JSON from response
             import re
@@ -2089,7 +2146,7 @@ Rules:
                 HumanMessage(content=allocation_prompt)
             ])
             
-            gemini_text = gemini_response.content if hasattr(gemini_response, 'content') else str(gemini_response)
+            gemini_text = self._extract_llm_text(gemini_response)
             
             # Extract JSON from response
             json_match = re.search(r'\{[\s\S]*\}', gemini_text)
@@ -3339,8 +3396,8 @@ Rules:
             print("\n⚠️  IBKR not connected - orders saved for manual execution")
             return {}
         
-        # Check buying power BEFORE placing orders
-        buying_power = self.get_buying_power()
+        # Check SETTLED CASH BEFORE placing orders (this is what IBKR actually validates against)
+        settled_cash = self.get_settled_cash()
         total_needed = sum(
             candidate['position']['actual_dollars'] 
             for candidate in selected 
@@ -3350,7 +3407,7 @@ Rules:
         print("\n" + "="*80)
         print("📊 EXECUTING APPROVED ORDERS")
         print("="*80)
-        print(f"💰 Buying Power: ${buying_power:.2f}")
+        print(f"💰 Settled Cash (T+2 Compliant): ${settled_cash:.2f}")
         print(f"💰 Capital Needed: ${total_needed:.2f}")
         
         # Check if market is open (for informational purposes)
@@ -3361,38 +3418,37 @@ Rules:
                 print("\n⏰ MARKET HOURS NOTICE:")
                 print("   Market is currently CLOSED (after-hours/pre-market)")
                 print("   Orders will be queued and executed at next market open (9:30 AM ET)")
-                print("   IBKR after-hours validation uses SettledCash (not ExcessLiquidity)")
-                print(f"   ExcessLiquidity (buying power): ${buying_power:.2f}")
-                print("   If order rejected: Funds may still be settling (T+2)\n")
+                print(f"   Settled Cash Available: ${settled_cash:.2f}")
+                print("   Note: Recently sold positions take T+2 to settle\n")
         except Exception as e:
             logger.debug(f"Market hours check skipped: {e}")
         
         # INTELLIGENT CAPITAL SCALING
         scale_factor = 1.0
-        if buying_power < total_needed:
-            if buying_power < total_needed * 0.40:
+        if settled_cash < total_needed:
+            if settled_cash < total_needed * 0.40:
                 # Less than 40% of needed capital - reject all orders
-                logger.error(f"❌ INSUFFICIENT CAPITAL: ${buying_power:.2f} < ${total_needed:.2f}")
+                logger.error(f"❌ INSUFFICIENT CAPITAL: ${settled_cash:.2f} < ${total_needed:.2f}")
                 print(f"\n❌ INSUFFICIENT CAPITAL - REJECTING ALL ORDERS")
-                print(f"   Available: ${buying_power:.2f}")
+                print(f"   Settled Cash Available: ${settled_cash:.2f}")
                 print(f"   Needed: ${total_needed:.2f}")
-                print(f"   Shortfall: ${total_needed - buying_power:.2f}")
+                print(f"   Shortfall: ${total_needed - settled_cash:.2f}")
                 print(f"\n💡 Need at least 40% of capital ({total_needed * 0.40:.2f}) to proceed.")
-                print(f"   Free up capital by closing positions or deposit more funds.")
+                print(f"   Wait for T+2 settlement or deposit more funds.")
                 print("="*80 + "\n")
                 return {}  # Return empty executions
             else:
                 # Scale down all orders proportionally
-                scale_factor = buying_power / total_needed
-                logger.warning(f"⚠️  Scaling down orders by {scale_factor:.1%} to fit capital")
+                scale_factor = settled_cash / total_needed
+                logger.warning(f"⚠️  Scaling down orders by {scale_factor:.1%} to fit settled cash")
                 print(f"\n⚠️  CAPITAL CONSTRAINED - SCALING DOWN ORDERS")
-                print(f"   Available: ${buying_power:.2f}")
+                print(f"   Settled Cash Available: ${settled_cash:.2f}")
                 print(f"   Requested: ${total_needed:.2f}")
                 print(f"   Scaling Factor: {scale_factor:.1%}")
                 print(f"   Adjusted Total: ${total_needed * scale_factor:.2f}")
-                print(f"\n💡 Each position will be reduced proportionally to fit available capital.")
+                print(f"\n💡 Each position will be reduced proportionally to fit available settled cash.")
         else:
-            print(f"✅ Sufficient capital available")
+            print(f"✅ Sufficient settled cash available")
         
         print("="*80 + "\n")
         
@@ -3417,9 +3473,15 @@ Rules:
                 print(f"   [SCALED] {original_shares} → {shares} shares (${adjusted_cost:.2f})")
             
             try:
-                # Create IBKR contract
+                # Create IBKR contract - no manual mappings, purely data-driven
                 contract = Stock(symbol, 'SMART', 'USD')
-                self.ib.qualifyContracts(contract)
+                qualified = self.ib.qualifyContracts(contract)
+                
+                # Verify qualification succeeded
+                if not qualified or not contract.conId:
+                    logger.warning(f"⚠️  {symbol}: IBKR cannot find this security - may be delisted or ticker changed")
+                    print(f"   [SKIPPED] {symbol}: IBKR cannot find this security (ticker may have changed)")
+                    continue
                 
                 # REDUNDANT CHECK: ETFs filtered in analysis phase (line ~903)
                 # Kept as safety net in case profile.isEtf was incorrect
@@ -3950,17 +4012,17 @@ Rules:
         # Connect to IBKR for automatic order execution
         self.connect_to_ibkr()
 
-        # ALWAYS use buying power (ExcessLiquidity) when IBKR connected
+        # ALWAYS use settled cash (T+2 compliant) when IBKR connected
         if self.ibkr_connected:
-            buying_power = self.get_buying_power()
-            if buying_power > 0:
-                self.capital = buying_power
-                logger.info(f"💰 Using IBKR Buying Power: ${self.capital:.2f}")
-                print(f"\n[CAPITAL] Using full buying power: ${self.capital:.2f}")
+            settled_cash = self.get_settled_cash()
+            if settled_cash > 0:
+                self.capital = settled_cash
+                logger.info(f"💰 Using IBKR Settled Cash: ${self.capital:.2f}")
+                print(f"\n[CAPITAL] Using settled cash (T+2 compliant): ${self.capital:.2f}")
                 print(f"[ALLOCATION] Position count and weights will be determined by LLM debate\n")
             else:
-                logger.warning("Buying power unavailable; falling back to configured capital")
-                print("\n[WARN] Buying power unavailable. Falling back to configured capital.\n")
+                logger.warning("Settled cash unavailable; falling back to configured capital")
+                print("\n[WARN] Settled cash unavailable. Falling back to configured capital.\n")
         else:
             logger.info(f"💰 Capital in use: ${self.capital:.2f} (IBKR not connected)")
         
@@ -4007,13 +4069,14 @@ Rules:
                         logger.info(f"💰 Available cash after exits: ${available_cash:.2f}")
                         break
 
-                # ALWAYS refresh buying power after exits
+                # ALWAYS refresh settled cash after exits (note: T+2 means exits won't increase settled cash immediately)
                 if self.ibkr_connected:
-                    updated_bp = self.get_buying_power()
-                    if updated_bp > 0:
-                        self.capital = updated_bp
-                        logger.info(f"💰 Capital updated after exits: Buying Power = ${self.capital:.2f}")
-                        print(f"[CAPITAL] Updated buying power after exits: ${self.capital:.2f}")
+                    updated_cash = self.get_settled_cash()
+                    if updated_cash > 0:
+                        self.capital = updated_cash
+                        logger.info(f"💰 Capital updated after exits: Settled Cash = ${self.capital:.2f}")
+                        print(f"[CAPITAL] Updated settled cash after exits: ${self.capital:.2f}")
+                        print("[NOTE] Recently sold positions take T+2 to settle - capital may be limited")
             
             logger.info("="*80)
             logger.info("📈 STEP 2: ENTRY LOGIC (searching for new opportunities)")
