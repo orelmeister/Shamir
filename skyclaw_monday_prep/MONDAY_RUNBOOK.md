@@ -26,10 +26,11 @@ SkyClaw cannot log in for you (IBKR needs your 2FA). You do this part:
 - Read-only signal scan (Senate/House + Form 4 open-market purchases, last 100d, politician-first).
 - `**` = politician **and** insider-cluster (strongest). Does **not** place orders.
 
-## STEP 3 — Decide account structure
-- If **cash account**: expect T+1 settlement locks. Recommended: upgrade to **margin** (Reg T, $2k min)
-  for legal same-day capital reuse. (PDT/$25k rule was abolished June 4 2026.)
-- If already margin: good, no change needed to validate.
+## STEP 3 — Cash-only discipline (NO margin, ever — David's rule)
+- **This account never uses margin, leverage, or borrowing.** Trade only the cash that's actually there.
+- That's fine: the swing strategy holds days-to-weeks, so it never needs same-day capital reuse.
+  Sell -> let the cash settle (T+1) -> redeploy the next day. Only ever deploy **settled** cash; keep a small buffer; don't churn.
+- If the account is technically a margin account, we simply never use the margin — settled cash only.
 
 ## STEP 4 — Paper / dry-run the Form 4 strategy (NO live orders)
 - The strategy already supports saving orders to JSON instead of executing. Run the analysis pass,
@@ -52,7 +53,7 @@ SkyClaw cannot log in for you (IBKR needs your 2FA). You do this part:
 - DB backed up to `databases\trading_history.backup_*.db` before any change.
 
 ## Decisions SkyClaw still needs from you
-1. Actual IBKR balance + **cash or margin?**
+1. Actual IBKR balance (cash-only is a given — **never margin**).
 2. Green-light the pivot: retire intraday day-trader, focus Form 4 swing, paper-first?
-3. Upgrade to margin account? (recommended)
+3. Cash-only is locked in as a permanent rule — no margin, no leverage, ever.
 4. The stale Feb positions — hold or close each (after Step 1 diff)?

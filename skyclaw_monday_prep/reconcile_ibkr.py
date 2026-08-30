@@ -67,8 +67,11 @@ for t in want[1:]:
         except: print(f"  {t:16}: {vals[t]}")
 # cash vs margin heuristic
 is_margin = ("MARGIN" in acct_type.upper()) or (float(vals.get("BuyingPower","0") or 0) > float(vals.get("TotalCashValue","0") or 0)*1.2)
-print(f"  -> Looks like a {'MARGIN' if is_margin else 'CASH'} account "
-      f"({'same-day capital reuse OK' if is_margin else 'T+1 settlement applies; consider margin upgrade'})")
+print(f"  -> Detected a {'MARGIN' if is_margin else 'CASH'} account.")
+if is_margin:
+    print("     RULE: this project is CASH-ONLY. Do NOT use margin/leverage/borrowing - trade settled cash only.")
+else:
+    print("     Good: cash-only matches the project rule. Hold swings for weeks; redeploy settled cash (T+1).")
 
 # ---- live positions ----
 print("\n=== LIVE POSITIONS (IBKR) ===")
