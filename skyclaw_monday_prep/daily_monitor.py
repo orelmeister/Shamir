@@ -5,6 +5,7 @@ Reports:
   - SWING sleeve (Form-4 insider-cluster): P&L vs -8% stop + verifies GTC stop orders exist
   - ROBOTICS sleeve (long-horizon): P&L vs -25% REVIEW trigger (NO auto-stop by design)
   - kill-switch: -15% from peak equity (swing sleeve only)
+  - M-gate (Law VI): SPX vs 50-day SMA + distribution days (IBKR-sourced, no FMP)
 
 Exit code 0 always (report-only). FLAG lines start with 'FLAG:' for easy grep.
 """
@@ -95,6 +96,39 @@ for p in positions:
         print(line + " | no stop by design (-25% review)")
         if pnl <= -25:
             print(f"FLAG: {sym} breached -25% ROBOTICS REVIEW trigger — needs manual review with David")
+
+# M-gate (Law VI): SPX vs 50-day SMA + distribution days (trailing 2 weeks).
+# Self-contained via IBKR (FMP was rate-limiting on 2026-10-05; don't depend on it here).
+def _m_gate():
+    try:
+        c = Stock("SPY", "SMART", "USD")
+        ib.qualifyContracts(c)
+        bars = ib.reqHistoricalData(c, endDateTime="", durationStr="80 D",
+                                    barSizeSetting="1 day", whatToShow="TRADES", useRTH=True)
+        if not bars or len(bars) < 55:
+            return {"error": "insufficient SPY history"}
+        closes = [b.close for b in bars]
+        vols = [b.volume for b in bars]
+        sma50 = sum(closes[-50:]) / 50.0
+        below = closes[-1] < sma50
+        dist = 0
+        for i in range(len(bars) - 10, len(bars)):
+            if i > 0 and closes[i] < closes[i - 1] and vols[i] >= vols[i - 1]:
+                dist += 1
+        blocked = bool(below or dist >= 2)
+        return {"spy_last": round(closes[-1], 2), "sma50": round(sma50, 2),
+                "below_50d": bool(below), "distribution_days": dist, "blocked": blocked}
+    except Exception as _e:
+        return {"error": str(_e)}
+
+_mg = _m_gate()
+if "error" in _mg:
+    print(f"\nM-GATE: unavailable ({_mg['error']})")
+else:
+    state = "BLOCKED (no new entries)" if _mg["blocked"] else "OPEN"
+    print(f"\nM-GATE: SPY ${_mg['spy_last']} vs 50d ${_mg['sma50']} | below50d={_mg['below_50d']} | dist_days={_mg['distribution_days']} | {state}")
+    if _mg["blocked"]:
+        print("FLAG: M-gate BLOCKED — no new entries (SPX < 50-day or 2+ distribution days)")
 
 # risk governor (Law III): swing equity vs peak
 swing_val = sum(p.position * p.avgCost for p in positions if p.contract.symbol not in ROBOTICS)
